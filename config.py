@@ -39,7 +39,7 @@ CLAUDE_CMD = "claude"
 
 # Supervisor 配置
 CHECK_INTERVAL = 300  # Supervisor 检查间隔（秒），默认 5 分钟
-MAX_TASK_DURATION = 3600  # 单个任务最大执行时间（秒），默认 1 小时
+# MAX_TASK_DURATION 已移除 - 改为由 Supervisor 智能判断，不设硬性上限
 
 
 # 任务状态
@@ -84,6 +84,47 @@ SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务。你是一�
 # 最大重试次数
 MAX_RETRIES = 2
 
+# 优雅退出配置
+GRACEFUL_SHUTDOWN_TIMEOUT = 60  # 清理会话最大时长（秒）
+
+# 清理会话提示模板
+CLEANUP_PROMPT_TEMPLATE = """⚠️ 紧急通知：任务需要终止，请立即执行清理工作。
+
+## 终止原因
+{reason}
+
+## 必须完成的清理工作（按顺序执行）
+
+### 1. 终止后台进程
+使用 `ps aux | grep -E "python|node|npm"` 查找你启动的后台进程，使用 `kill` 终止它们。
+
+### 2. 清理临时文件
+删除不需要的临时文件（但保留有用的调试文件）。
+
+### 3. 输出交接摘要（重要！）
+完成清理后，请在最后输出以下格式的交接摘要，用于传递给下一个 Worker：
+
+```HANDOVER_START```
+## 当前进度
+[描述已完成的工作，如：已完成X功能，正在进行Y步骤]
+
+## 遇到的问题
+[描述遇到的问题和尝试的解决方案]
+
+## 下一步建议
+[给下一个 Worker 的具体建议，如：需要先解决Z问题，建议从W开始]
+
+## 关键文件
+[列出重要的文件路径和说明]
+```HANDOVER_END```
+
+最后输出 "CLEANUP_DONE" 表示已完成。
+
+注意：
+- 不要直接修改 tasks.json 或 progress.md 文件
+- 只需在输出中包含上述交接摘要，系统会自动处理
+"""
+
 # 进度日志格式
 PROGRESS_ENTRY_FORMAT = """
 ---
@@ -94,3 +135,34 @@ PROGRESS_ENTRY_FORMAT = """
 **详情**:
 {details}
 """
+
+# 任务生成提示模板
+TASK_GENERATION_PROMPT = """根据用户需求，生成结构化的开发任务。
+
+## 用户需求
+{user_request}
+
+## 项目上下文
+{project_context}
+
+## 现有任务 ID
+{existing_ids}
+
+## 输出格式
+输出一个 JSON 数组，每个任务包含：
+- id: 唯一标识，格式如 "001", "002"（避开已有 ID）
+- description: 简洁的任务描述（20字内）
+- priority: 优先级数字（越小越优先）
+- steps: 具体步骤列表
+
+## 要求
+1. 任务粒度适中，每个任务可在 10 分钟内完成
+2. 步骤具体可执行，指明文件路径
+3. 任务间有依赖时，用 priority 控制顺序
+4. 只输出 JSON，不要其他内容
+
+```json
+[
+  {{"id": "xxx", "description": "...", "priority": N, "steps": ["...", "..."]}}
+]
+```"""

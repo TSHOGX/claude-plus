@@ -39,7 +39,12 @@ python3 main.py init
 
 ### 2. 创建任务文件
 
-在工作目录创建 `tasks.json`：
+**方式一：使用 AI 生成任务**
+```bash
+python3 main.py -w ~/my-project add "实现用户登录功能，包括注册和密码加密"
+```
+
+**方式二：手动创建 tasks.json**
 
 ```json
 [
@@ -78,6 +83,7 @@ python3 main.py -w ~/my-project status
 | `init` | 初始化工作环境，创建 Git 快照保护现有代码 |
 | `run` | 运行任务处理 |
 | `status` | 显示当前状态 |
+| `add "描述"` | 根据自然语言描述新增任务 |
 | `reset` | 重置所有任务 |
 | `reset-task <id>` | 重置单个任务 |
 

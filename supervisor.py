@@ -36,23 +36,41 @@ class SupervisorResult:
     suggestion: Optional[str] = None  # 如果是 INTERVENE，包含建议
 
 
-# Supervisor 分析提示模板（简化版）
-SUPERVISOR_PROMPT = """分析任务执行进度，判断是否需要干预。
+# Supervisor 分析提示模板（改进版）
+SUPERVISOR_PROMPT = """你是 Agent 执行监督者，负责分析 Worker 进度并做出决策。
 
-## 任务
-{task_description}
+## 任务信息
+- 描述: {task_description}
+- 已运行: {elapsed_time}
+- 检查次数: {check_count}
 
 ## 执行流程
 {worker_summary}
 
-## 输出 JSON
-{{"decision": "continue|split|wait|intervene", "reason": "简要原因"}}
+## 决策标准
 
-决策说明:
-- continue: 正常进行，继续等待
-- split: 任务太复杂或陷入循环，需拆分（需附加 subtasks 字段）
-- wait: 正在等待长时间操作（训练/构建），转后台
-- intervene: 遇到无法解决的问题，需人工介入
+### continue（继续）- 默认选择
+- Agent 有新的工具调用或思考
+- 正在进行有意义的调试
+- 长时间操作有进展迹象（如训练 loss 在变化）
+
+### split（拆分）
+- 陷入循环（重复相同操作 5+ 次）
+- 任务范围明显过大
+- Agent 表示需要分步处理
+
+### wait（后台）
+- 执行长时间操作（训练/构建/下载）
+- 无需实时交互
+- 已设置等待进程完成
+
+### intervene（人工介入）
+- 遇到无法解决的阻塞
+- 需要用户凭证/确认/决策
+- 系统级错误（权限/网络等）
+
+## 输出 JSON
+{{"decision": "continue|split|wait|intervene", "reason": "简要原因（20字内）"}}
 """
 
 
@@ -63,14 +81,25 @@ class Supervisor:
         self.workspace_dir = workspace_dir
         self.verbose = verbose
 
-    def analyze(self, task: Task, worker: WorkerProcess) -> SupervisorResult:
+    def analyze(
+        self, task: Task, worker: WorkerProcess, check_count: int = 0, elapsed: float = 0
+    ) -> SupervisorResult:
         """分析 Worker 执行情况并做出决策"""
         # 获取 Worker 日志摘要
         worker_summary = worker.get_log_summary()
 
-        # 构建分析提示（简化版）
+        # 格式化运行时长
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        secs = int(elapsed % 60)
+        elapsed_time = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        # 构建分析提示
         prompt = SUPERVISOR_PROMPT.format(
-            task_description=task.description, worker_summary=worker_summary
+            task_description=task.description,
+            worker_summary=worker_summary,
+            check_count=check_count,
+            elapsed_time=elapsed_time,
         )
 
         if self.verbose:

@@ -12,6 +12,7 @@
 
 import os
 import sys
+import signal
 import argparse
 import subprocess
 from datetime import datetime
@@ -20,9 +21,10 @@ from config import (
     DEFAULT_WORKSPACE_DIR,
     MAX_RETRIES,
     CHECK_INTERVAL,
-    MAX_TASK_DURATION,
     get_paths,
     is_safe_workspace,
+    CLAUDE_CMD,
+    TASK_GENERATION_PROMPT,
 )
 from task_manager import TaskManager, Task
 from progress_log import ProgressLog
@@ -186,6 +188,106 @@ echo "=== 初始化完成 ==="
         print(f"  已完成: {stats['completed']}")
         print(f"  失败: {stats['failed']}")
 
+    def _get_worker_activity(self, worker: WorkerProcess) -> str:
+        """获取 Worker 最近活动摘要"""
+        log = worker.read_log()
+        if not log.events:
+            return ""
+
+        # 获取最近的事件
+        recent = log.events[-3:]
+        activities = []
+        for evt in recent:
+            if evt["type"] == "tool":
+                name = evt["name"]
+                inp = evt.get("input", "")[:25]
+                activities.append(f"{name}({inp})")
+            elif evt["type"] == "text":
+                activities.append(evt["content"][:35] + "...")
+
+        return " → ".join(activities) if activities else ""
+
+    def _format_duration(self, seconds: float) -> str:
+        """格式化时长为 HH:MM:SS"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _print_realtime_event(self, evt: dict, elapsed_str: str):
+        """实时打印事件"""
+        evt_type = evt.get("type", "")
+
+        if evt_type == "tool":
+            name = evt.get("name", "")
+            inp = evt.get("input", "")
+            # 工具调用用蓝色高亮
+            if inp:
+                print(f"   [{elapsed_str}] \033[36m🔧 {name}\033[0m: {inp}")
+            else:
+                print(f"   [{elapsed_str}] \033[36m🔧 {name}\033[0m")
+
+        elif evt_type == "text":
+            content = evt.get("content", "")
+            # 思考内容用灰色
+            print(f"   [{elapsed_str}] \033[90m💭 {content}\033[0m")
+
+        elif evt_type == "result":
+            is_error = evt.get("is_error", False)
+            result = evt.get("result", "")
+            if is_error:
+                print(f"   [{elapsed_str}] \033[31m❌ 错误: {result}\033[0m")
+            else:
+                print(f"   [{elapsed_str}] \033[32m✅ 完成: {result}\033[0m")
+
+    def _display_handover_summary(self, summary: str):
+        """展示交接摘要给用户"""
+        print("\n" + "=" * 60)
+        print("📝 Worker 交接摘要")
+        print("=" * 60)
+        # 逐行打印，添加缩进
+        for line in summary.strip().split("\n"):
+            # 标题行加粗
+            if line.startswith("## "):
+                print(f"\033[1m{line}\033[0m")
+            else:
+                print(f"   {line}")
+        print("=" * 60 + "\n")
+
+    def _generate_activity_summary(self, worker_log, activity_summary: str) -> str:
+        """从日志中生成活动摘要（当没有交接摘要时使用）"""
+        lines = ["## 执行情况（自动生成）"]
+        lines.append("Worker 在中断前未能完成交接摘要，以下是从日志中提取的活动记录：")
+        lines.append("")
+
+        # 提取工具调用
+        tool_calls = [e for e in worker_log.events if e.get("type") == "tool"]
+        if tool_calls:
+            lines.append("## 执行的操作")
+            for evt in tool_calls[-10:]:  # 最近10个操作
+                name = evt.get("name", "")
+                inp = evt.get("input", "")
+                if inp:
+                    lines.append(f"- {name}: {inp[:60]}")
+                else:
+                    lines.append(f"- {name}")
+            lines.append("")
+
+        # 提取思考内容
+        text_events = [e for e in worker_log.events if e.get("type") == "text"]
+        if text_events:
+            lines.append("## 最后的思考")
+            # 只取最后一个有意义的思考
+            last_thought = text_events[-1].get("content", "")
+            if last_thought:
+                lines.append(last_thought[:200])
+            lines.append("")
+
+        lines.append("## 下一步建议")
+        lines.append("任务被用户中断，下一个 Worker 应该从头开始或继续上述操作")
+
+        return "\n".join(lines)
+
     def _get_last_good_commit(self) -> str:
         """获取最后一个成功的 commit hash"""
         result = subprocess.run(
@@ -252,7 +354,7 @@ echo "=== 初始化完成 ==="
         print("\n" + "=" * 60)
         print("🤖 开始处理任务（Supervised 模式）")
         print("=" * 60)
-        print(f"   检查间隔: {CHECK_INTERVAL}秒 | 最大时长: {MAX_TASK_DURATION}秒")
+        print(f"   检查间隔: {CHECK_INTERVAL}秒 | Supervisor: 每次检查都分析")
         print("   提示: 按 Ctrl+C 可安全终止\n")
 
         tasks_processed = 0
@@ -302,40 +404,49 @@ echo "=== 初始化完成 ==="
                 print(f"   🚀 Worker 启动: PID {pid}")
                 print(f"   📄 日志: {worker.log_file}")
 
-                # 监督循环
+                # 监督循环 - 实时显示日志，定期调用 supervisor
                 check_count = 0
                 decision_made = False
+                last_supervisor_time = time.time()
+                REALTIME_INTERVAL = 2  # 实时日志检查间隔（秒）
+
+                print()  # 空行，准备实时输出
 
                 while worker.is_alive():
-                    time.sleep(CHECK_INTERVAL)
-                    check_count += 1
+                    time.sleep(REALTIME_INTERVAL)
                     elapsed = worker.elapsed_seconds()
+                    elapsed_str = self._format_duration(elapsed)
 
-                    if self.verbose:
-                        print(f"   ⏱️  检查 #{check_count}: 已运行 {elapsed:.0f}s")
+                    # 实时显示新事件
+                    new_events = worker.read_new_events()
+                    for evt in new_events:
+                        self._print_realtime_event(evt, elapsed_str)
 
-                    # 检查是否超过最大时长
-                    if elapsed > MAX_TASK_DURATION:
-                        print(f"   ⚠️  超过最大时长，请求 Supervisor 分析...")
-                        sv_result = self.supervisor.analyze(task, worker)
-                        self._handle_supervisor_decision(
-                            task, worker, sv_result, commit_before_task
+                    # 检查是否到达 supervisor 检查时间
+                    time_since_last_check = time.time() - last_supervisor_time
+                    if time_since_last_check >= CHECK_INTERVAL:
+                        check_count += 1
+                        last_supervisor_time = time.time()
+
+                        # Supervisor 检查分隔线
+                        print(f"\n   {'─' * 40}")
+                        print(f"   🔍 [{elapsed_str}] Supervisor 检查 #{check_count}")
+
+                        # 调用 Supervisor 分析
+                        sv_result = self.supervisor.analyze(
+                            task, worker, check_count, elapsed
                         )
-                        decision_made = True
-                        break
+                        print(
+                            f"      📋 决策: \033[1m{sv_result.decision.value}\033[0m | {sv_result.reason}"
+                        )
+                        print(f"   {'─' * 40}\n")
 
-                    # 快速检查是否有异常模式
-                    if self.supervisor.quick_check(worker):
-                        print(f"   🔍 检测到异常模式，请求 Supervisor 分析...")
-                        sv_result = self.supervisor.analyze(task, worker)
                         if sv_result.decision != Decision.CONTINUE:
                             self._handle_supervisor_decision(
                                 task, worker, sv_result, commit_before_task
                             )
                             decision_made = True
                             break
-                        else:
-                            print(f"   ✅ Supervisor: {sv_result.reason}")
 
                 # Worker 自然结束
                 if not decision_made:
@@ -350,14 +461,62 @@ echo "=== 初始化完成 ==="
             print("⚠️  检测到 Ctrl+C，正在安全终止...")
             print("=" * 60)
 
-            if current_worker and current_worker.is_alive():
-                print(f"\n正在终止 Worker...")
-                current_worker.terminate(graceful=True)
-                print(f"   ✅ Worker 已终止")
+            cleanup_result = None
+            if current_worker:
+                # 先读取日志，获取执行情况（在终止前）
+                worker_log = current_worker.read_log()
+                activity_summary = current_worker.get_log_summary(max_events=20)
 
-            if commit_before_task:
+                if current_worker.is_alive():
+                    print(f"\n正在优雅终止 Worker...")
+                    # 使用优雅关闭：先中断，然后让 Worker 执行清理工作
+                    cleanup_result = current_worker.graceful_shutdown(
+                        reason="用户按下 Ctrl+C 请求终止"
+                    )
+                    if cleanup_result.success:
+                        print(f"   ✅ Worker 已优雅终止并完成清理")
+                    else:
+                        print(f"   ⚠️  Worker 已终止（清理可能不完整）")
+                else:
+                    print(f"\n   ✅ Worker 已结束")
+                    cleanup_result = type(
+                        "CleanupResult", (), {"success": True, "handover_summary": None}
+                    )()
+
+                # 记录中断信息到 progress.md
+                if task:
+                    if cleanup_result and cleanup_result.handover_summary:
+                        # 有交接摘要，使用交接摘要
+                        self.progress_log.log_handover(
+                            task.id,
+                            task.description,
+                            worker_log.session_id,
+                            cleanup_result.handover_summary,
+                        )
+                        print(f"   📋 交接摘要已记录到 progress.md")
+                        self._display_handover_summary(cleanup_result.handover_summary)
+                    else:
+                        # 没有交接摘要，从日志中生成活动记录
+                        auto_summary = self._generate_activity_summary(
+                            worker_log, activity_summary
+                        )
+                        self.progress_log.log_handover(
+                            task.id,
+                            task.description,
+                            worker_log.session_id,
+                            auto_summary,
+                        )
+                        print(f"   📋 活动记录已保存到 progress.md")
+                        self._display_handover_summary(auto_summary)
+
+            # 只有在清理失败时才回退代码
+            cleanup_success = cleanup_result.success if cleanup_result else False
+            if not cleanup_success and commit_before_task:
+                print(f"\n   ⚠️  清理未完成，回退代码以确保一致性...")
                 if self._git_reset_to(commit_before_task):
                     print(f"   ✅ 已回退到 commit: {commit_before_task[:8]}")
+            elif cleanup_success:
+                print(f"\n   ✅ Worker 已保存工作状态，代码保留")
 
             print("\n下次可以继续运行: python3 main.py run")
             return
@@ -376,9 +535,36 @@ echo "=== 初始化完成 ==="
         print(f"   📋 Supervisor 决策: {sv_result.decision.value}")
         print(f"   📋 原因: {sv_result.reason}")
 
-        # 终止 Worker
+        # 先读取日志（在终止前）
+        worker_log = worker.read_log()
+        activity_summary = worker.get_log_summary(max_events=20)
+
+        # 终止 Worker（使用优雅关闭）
+        cleanup_result = None
         if worker.is_alive():
-            worker.terminate(graceful=True)
+            cleanup_result = worker.graceful_shutdown(
+                reason=f"Supervisor 决策: {sv_result.reason}"
+            )
+
+        # 记录交接或活动摘要到 progress.md
+        if cleanup_result and cleanup_result.handover_summary:
+            # 有交接摘要，使用交接摘要
+            self.progress_log.log_handover(
+                task.id,
+                task.description,
+                worker_log.session_id,
+                cleanup_result.handover_summary,
+            )
+            print(f"   📋 交接摘要已记录")
+            self._display_handover_summary(cleanup_result.handover_summary)
+        else:
+            # 没有交接摘要，从日志中生成活动记录
+            auto_summary = self._generate_activity_summary(worker_log, activity_summary)
+            self.progress_log.log_handover(
+                task.id, task.description, worker_log.session_id, auto_summary
+            )
+            print(f"   📋 活动记录已保存")
+            self._display_handover_summary(auto_summary)
 
         if sv_result.decision == Decision.SPLIT:
             # 分裂任务
@@ -475,6 +661,159 @@ echo "=== 初始化完成 ==="
             print(f"  {status_icon} [{task.id}] {task.description}")
 
         print("\n" + self.progress_log.get_summary())
+
+    def add_task_from_prompt(self, user_request: str):
+        """根据用户自然语言描述生成并添加任务"""
+        import json as json_module
+
+        print("\n" + "=" * 60)
+        print("🤖 分析需求，生成任务...")
+        print("=" * 60)
+
+        # 收集项目上下文
+        context_parts = []
+        print("   📂 收集项目上下文...")
+
+        # 1. 读取 progress.md 获取历史
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, "r", encoding="utf-8") as f:
+                    progress_content = f.read()[-2000:]  # 最近 2000 字符
+                    if progress_content.strip():
+                        context_parts.append(f"### 最近进度\n{progress_content}")
+                        print("      ✓ 读取 progress.md")
+            except:
+                pass
+
+        # 2. 获取现有任务描述
+        existing_tasks = self.task_manager.get_all_tasks()
+        if existing_tasks:
+            task_list = "\n".join(
+                [f"- [{t.id}] {t.description} ({t.status})" for t in existing_tasks]
+            )
+            context_parts.append(f"### 现有任务\n{task_list}")
+            print(f"      ✓ 现有 {len(existing_tasks)} 个任务")
+
+        # 3. 获取目录结构
+        try:
+            result = subprocess.run(
+                ["find", ".", "-type", "f", "-name", "*.py", "-o", "-name", "*.js", "-o", "-name", "*.ts"],
+                cwd=self.workspace_dir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.stdout.strip():
+                files = result.stdout.strip().split("\n")[:20]  # 最多 20 个文件
+                context_parts.append(f"### 项目文件\n" + "\n".join(files))
+                print(f"      ✓ 扫描到 {len(files)} 个代码文件")
+        except:
+            pass
+
+        project_context = "\n\n".join(context_parts) if context_parts else "（新项目，暂无历史）"
+
+        # 获取现有 ID
+        existing_ids = [t.id for t in existing_tasks]
+        ids_str = ", ".join(existing_ids) if existing_ids else "（暂无）"
+
+        # 构建 prompt
+        prompt = TASK_GENERATION_PROMPT.format(
+            user_request=user_request,
+            project_context=project_context,
+            existing_ids=ids_str,
+        )
+
+        # 调用 Claude 生成任务（使用流式输出）
+        print("\n   🧠 Claude 分析中...")
+        print("   " + "-" * 40)
+
+        try:
+            process = subprocess.Popen(
+                [
+                    CLAUDE_CMD,
+                    "-p",
+                    "--verbose",
+                    "--output-format", "stream-json",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=self.workspace_dir,
+            )
+
+            # 实时读取输出
+            full_result = ""
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json_module.loads(line)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "assistant":
+                        # 思考内容
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                # 显示前 80 字符
+                                preview = text[:80].replace("\n", " ")
+                                if preview:
+                                    print(f"   💭 {preview}...")
+
+                    elif evt_type == "result":
+                        full_result = event.get("result", "")
+                        cost = event.get("total_cost_usd", 0)
+                        print(f"   " + "-" * 40)
+                        print(f"   💰 成本: ${cost:.4f}")
+
+                except json_module.JSONDecodeError:
+                    continue
+
+            process.wait()
+
+            if process.returncode != 0:
+                stderr = process.stderr.read()
+                print(f"❌ Claude 调用失败: {stderr}")
+                return False
+
+            # 提取 JSON
+            json_start = full_result.find("[")
+            json_end = full_result.rfind("]") + 1
+            if json_start == -1 or json_end == 0:
+                print(f"❌ 无法解析任务 JSON")
+                print(f"   原始输出: {full_result[:200]}")
+                return False
+
+            tasks_data = json_module.loads(full_result[json_start:json_end])
+
+            # 添加任务
+            print("\n   📝 添加任务:")
+            added_count = 0
+            for task_dict in tasks_data:
+                task = Task(
+                    id=task_dict.get("id", f"auto_{len(existing_tasks) + added_count + 1}"),
+                    description=task_dict.get("description", ""),
+                    priority=task_dict.get("priority", 99),
+                    steps=task_dict.get("steps", []),
+                )
+                self.task_manager.add_task(task)
+                added_count += 1
+                print(f"      ✅ [{task.id}] {task.description}")
+
+            print(f"\n✅ 成功添加 {added_count} 个任务")
+            print(f"   运行 'python3 main.py run' 开始执行")
+            return True
+
+        except json_module.JSONDecodeError as e:
+            print(f"❌ JSON 解析失败: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ 生成失败: {e}")
+            return False
 
     def reset(self):
         """重置所有任务状态"""
@@ -600,10 +939,21 @@ echo "=== 初始化完成 ==="
 
         pid = task.background_pid
         try:
-            os.kill(pid, 9)  # SIGKILL
-            print(f"✅ 已终止进程 PID {pid}")
+            # 使用进程组终止，确保所有子进程也被终止
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGKILL)
+            print(f"✅ 已终止进程组 PGID {pgid}")
         except ProcessLookupError:
             print(f"⚠️  进程 {pid} 已不存在")
+        except OSError:
+            # 可能不是进程组 leader，尝试终止单个进程
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"✅ 已终止进程 PID {pid}")
+            except ProcessLookupError:
+                print(f"⚠️  进程 {pid} 已不存在")
+            except Exception as e:
+                print(f"❌ 终止进程失败: {e}")
         except Exception as e:
             print(f"❌ 终止进程失败: {e}")
 
@@ -665,6 +1015,10 @@ def main():
     kill_parser = subparsers.add_parser("kill-bg", help="终止后台任务")
     kill_parser.add_argument("task_id", help="任务 ID")
 
+    # add 命令
+    add_parser = subparsers.add_parser("add", help="根据描述新增任务")
+    add_parser.add_argument("description", help="任务需求描述")
+
     args = parser.parse_args()
 
     # 安全检查
@@ -693,6 +1047,8 @@ def main():
         agent.view_task_log(args.task_id, args.lines)
     elif args.command == "kill-bg":
         agent.kill_background_task(args.task_id)
+    elif args.command == "add":
+        agent.add_task_from_prompt(args.description)
     else:
         parser.print_help()
 

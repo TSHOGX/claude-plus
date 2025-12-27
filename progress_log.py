@@ -181,3 +181,21 @@ class ProgressLog:
 - 重置任务: python3 main.py reset-task {task_id}
 """,
         )
+
+    def log_handover(
+        self, task_id: str, description: str, session_id: str, handover_summary: str
+    ):
+        """记录任务交接摘要（用于 Worker 中断时的上下文传递）"""
+        self.append(
+            task_id=task_id,
+            description=description,
+            status="interrupted",
+            session_id=session_id or "无",
+            details=f"""任务被中断，已生成交接摘要
+
+{handover_summary}
+
+---
+*此交接摘要将传递给下一个 Worker*
+""",
+        )
