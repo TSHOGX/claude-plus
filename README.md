@@ -134,6 +134,7 @@ python3 main.py -w ~/my-project -q run
 ```bash
 # 查看 commit 历史
 git log --oneline -5
+git log --graph --pretty=format:"%C(yellow)%h%Creset %C(cyan)%ad%Creset %s %C(auto)%d%Creset" --date=format:"%Y-%m-%d %H:%M:%S" -5
 
 # 回退到指定 commit
 git reset --hard <commit-hash>

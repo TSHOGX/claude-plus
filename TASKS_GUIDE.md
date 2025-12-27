@@ -69,11 +69,3 @@
     "steps": ["添加 search_posts(keyword) 方法", "搜索标题和内容", "返回匹配结果列表"]}
 ]
 ```
-
----
-为什么用 JSON 而不是 Markdown？
-
-来自 Anthropic 博客的经验：
-"模型不太可能不适当地更改或覆盖 JSON 文件"
-
-JSON 的结构化格式让 Claude 更容易理解任务边界，减少误操作风险。
