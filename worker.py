@@ -47,14 +47,12 @@ class CleanupResult:
 class WorkerProcess:
     """Worker 进程封装 - 管理 Claude CLI 后台执行"""
 
-    def __init__(self, task: Task, workspace_dir: str, recent_progress: str = ""):
+    def __init__(self, task: Task, workspace_dir: str):
         self.task = task
         self.workspace_dir = workspace_dir
-        self.recent_progress = recent_progress
         self.process: Optional[subprocess.Popen] = None
-        # 带重试次数的日志文件名，避免重试时覆盖旧日志
-        retry_suffix = f"_r{task.retries}" if task.retries > 0 else ""
-        self.log_file = os.path.join(workspace_dir, f".worker_{task.id}{retry_suffix}.log")
+        # 日志文件名使用 task id
+        self.log_file = os.path.join(workspace_dir, f".worker_{task.id}.log")
         self.start_time: Optional[float] = None
         # 实时日志追踪
         self._last_log_position: int = 0
@@ -68,10 +66,6 @@ class WorkerProcess:
         return SYSTEM_PROMPT_TEMPLATE.format(
             task_description=self.task.description,
             task_steps=steps_text if steps_text else "无具体步骤，请自行规划",
-            recent_progress=(
-                self.recent_progress if self.recent_progress else "这是第一个任务"
-            ),
-            workspace_dir=self.workspace_dir,
         )
 
     def _build_task_prompt(self) -> str:

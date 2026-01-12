@@ -19,7 +19,6 @@ from datetime import datetime
 
 from config import (
     DEFAULT_WORKSPACE_DIR,
-    MAX_RETRIES,
     CHECK_INTERVAL,
     get_paths,
     is_safe_workspace,
@@ -27,9 +26,11 @@ from config import (
     TASK_GENERATION_PROMPT,
 )
 from task_manager import TaskManager, Task
-from progress_log import ProgressLog
+# progress_log 已弃用，进度通过 git commit 和 task.notes 追踪
 from worker import WorkerProcess
 from supervisor import Supervisor, Decision
+from validator import PostWorkValidator
+from orchestrator import TaskOrchestrator
 
 
 class LongRunningAgent:
@@ -40,14 +41,13 @@ class LongRunningAgent:
         self.paths = get_paths(workspace_dir)
         self.workspace_dir = self.paths["workspace"]
         self.tasks_file = self.paths["tasks_file"]
-        self.progress_file = self.paths["progress_file"]
         self.init_script = self.paths["init_script"]
         self.verbose = verbose
 
         # 初始化组件（使用动态路径）
         self.task_manager = TaskManager(self.tasks_file)
-        self.progress_log = ProgressLog(self.progress_file)
         self.supervisor = Supervisor(self.workspace_dir, verbose=verbose)
+        self.orchestrator = TaskOrchestrator(self.workspace_dir, verbose=verbose)
         self.total_cost = 0.0
 
     def initialize(self):
@@ -101,8 +101,8 @@ class LongRunningAgent:
         else:
             print(f"✓ 任务文件: {self.tasks_file}")
 
-        # 5. 初始化进度日志
-        print(f"✓ 进度日志: {self.progress_log.progress_file}")
+        # 5. 进度由 git 管理（无需额外配置）
+        print("\u2713 进度追踪: Git")
 
         # 6. 提交初始化脚本等配置文件
         if self._has_uncommitted_changes():
@@ -288,6 +288,18 @@ echo "=== 初始化完成 ==="
 
         return "\n".join(lines)
 
+    def _get_git_context(self) -> str:
+        """获取 Git 历史作为进度上下文"""
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-10"],
+            cwd=self.workspace_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return "（首个任务，暂无历史）"
+
     def _get_last_good_commit(self) -> str:
         """获取最后一个成功的 commit hash"""
         result = subprocess.run(
@@ -322,7 +334,6 @@ echo "=== 初始化完成 ==="
         print(f"   ID: {task.id}")
         print(f"   描述: {task.description}")
         print(f"   错误: {task.error_message}")
-        print(f"   重试次数: {task.retries}")
 
         print(f"\n## 建议操作")
         print("   1. 检查错误信息，确认问题原因")
@@ -335,11 +346,26 @@ echo "=== 初始化完成 ==="
 
         print(f"\n## 相关文件")
         print(f"   任务文件: {self.tasks_file}")
-        print(f"   进度日志: {self.progress_log.progress_file}")
 
         if task.session_id:
             print(f"\n## 调试命令")
             print(f"   恢复会话查看详情：claude -r {task.session_id}")
+
+    def _has_failed_tasks(self) -> bool:
+        """检查是否有失败的任务"""
+        from config import TaskStatus
+        return any(t.status == TaskStatus.FAILED for t in self.task_manager.get_all_tasks())
+
+    def _get_failed_tasks_summary(self) -> str:
+        """获取失败任务摘要"""
+        from config import TaskStatus
+        failed = [t for t in self.task_manager.get_all_tasks() if t.status == TaskStatus.FAILED]
+        if not failed:
+            return "无失败任务"
+        lines = ["失败任务列表:"]
+        for t in failed:
+            lines.append(f"- [{t.id}] {t.description}: {t.error_message or '未知错误'}")
+        return "\n".join(lines)
 
     def run(self, max_tasks: int = None):
         """运行主循环处理任务（Supervisor-Worker 架构）"""
@@ -369,37 +395,36 @@ echo "=== 初始化完成 ==="
                     break
 
                 # 获取下一个任务
-                task = self.task_manager.get_next_task(max_retries=MAX_RETRIES + 1)
+                task = self.task_manager.get_next_task()
                 if not task:
+                    # 检查是否有失败任务需要编排
+                    if self._has_failed_tasks():
+                        print("\n🎭 有失败任务，调用 Orchestrator 重新审视...")
+                        self.orchestrator.orchestrate(
+                            trigger="所有可执行任务完成，但有失败任务需要处理",
+                            context=self._get_failed_tasks_summary()
+                        )
+                        continue
                     print("\n✅ 所有任务已完成!")
-                    break
-
-                # 检查重试次数
-                if task.retries >= MAX_RETRIES:
-                    print(f"\n⚠️  任务 [{task.id}] 已达到最大重试次数")
-                    self._guide_user_for_failure(task)
                     break
 
                 # 记录任务开始前的 commit
                 commit_before_task = self._get_last_good_commit()
 
                 # 显示任务信息
-                retry_info = f" (重试 #{task.retries})" if task.retries > 0 else ""
                 print(f"\n{'─' * 50}")
-                print(f"📝 处理任务 [{task.id}]: {task.description}{retry_info}")
+                print(f"📝 处理任务 [{task.id}]: {task.description}")
                 print(f"   优先级: {task.priority}")
+                if task.notes:
+                    print(f"   📋 备注: {task.notes[:50]}...")
                 print(f"{'─' * 50}")
 
-                # 获取最近进度
-                recent_progress = self.progress_log.get_recent(3)
-
                 # 创建并启动 Worker
-                worker = WorkerProcess(task, self.workspace_dir, recent_progress)
+                worker = WorkerProcess(task, self.workspace_dir)
                 current_worker = worker
                 pid = worker.start()
 
                 self.task_manager.mark_in_progress(task.id, f"worker_{pid}")
-                self.progress_log.log_start(task.id, task.description, f"worker_{pid}")
 
                 print(f"   🚀 Worker 启动: PID {pid}")
                 print(f"   📄 日志: {worker.log_file}")
@@ -483,30 +508,20 @@ echo "=== 初始化完成 ==="
                         "CleanupResult", (), {"success": True, "handover_summary": None}
                     )()
 
-                # 记录中断信息到 progress.md
+                # 记录中断信息到 task.notes（供下次 loop 使用）
                 if task:
                     if cleanup_result and cleanup_result.handover_summary:
-                        # 有交接摘要，使用交接摘要
-                        self.progress_log.log_handover(
-                            task.id,
-                            task.description,
-                            worker_log.session_id,
-                            cleanup_result.handover_summary,
-                        )
-                        print(f"   📋 交接摘要已记录到 progress.md")
+                        # 有交接摘要，写入 task.notes
+                        self.task_manager.update_notes(task.id, f"中断交接:\n{cleanup_result.handover_summary}")
+                        print(f"   📋 交接摘要已记录到 task.notes")
                         self._display_handover_summary(cleanup_result.handover_summary)
                     else:
                         # 没有交接摘要，从日志中生成活动记录
                         auto_summary = self._generate_activity_summary(
                             worker_log, activity_summary
                         )
-                        self.progress_log.log_handover(
-                            task.id,
-                            task.description,
-                            worker_log.session_id,
-                            auto_summary,
-                        )
-                        print(f"   📋 活动记录已保存到 progress.md")
+                        self.task_manager.update_notes(task.id, f"中断交接:\n{auto_summary}")
+                        print(f"   📋 活动记录已保存到 task.notes")
                         self._display_handover_summary(auto_summary)
 
             # 只有在清理失败时才回退代码
@@ -546,59 +561,38 @@ echo "=== 初始化完成 ==="
                 reason=f"Supervisor 决策: {sv_result.reason}"
             )
 
-        # 记录交接或活动摘要到 progress.md
+        # 记录交接或活动摘要到 task.notes
         if cleanup_result and cleanup_result.handover_summary:
-            # 有交接摘要，使用交接摘要
-            self.progress_log.log_handover(
-                task.id,
-                task.description,
-                worker_log.session_id,
-                cleanup_result.handover_summary,
-            )
-            print(f"   📋 交接摘要已记录")
+            # 有交接摘要，写入 task.notes
+            self.task_manager.update_notes(task.id, f"Supervisor中断:\n{cleanup_result.handover_summary}")
+            print(f"   📋 交接摘要已记录到 task.notes")
             self._display_handover_summary(cleanup_result.handover_summary)
         else:
             # 没有交接摘要，从日志中生成活动记录
             auto_summary = self._generate_activity_summary(worker_log, activity_summary)
-            self.progress_log.log_handover(
-                task.id, task.description, worker_log.session_id, auto_summary
-            )
-            print(f"   📋 活动记录已保存")
+            self.task_manager.update_notes(task.id, f"Supervisor中断:\n{auto_summary}")
+            print(f"   📋 活动记录已保存到 task.notes")
             self._display_handover_summary(auto_summary)
 
-        if sv_result.decision == Decision.SPLIT:
-            # 分裂任务
-            if sv_result.subtasks:
-                if self.task_manager.split_task(task.id, sv_result.subtasks):
-                    print(f"   ✅ 已拆分为 {len(sv_result.subtasks)} 个子任务")
-                    # 回退代码
-                    if commit_before and self._git_reset_to(commit_before):
-                        print(f"   ✅ 已回退代码到: {commit_before[:8]}")
-                else:
-                    self.task_manager.mark_failed(task.id, "任务拆分失败")
-
-        elif sv_result.decision == Decision.WAIT_BACKGROUND:
-            # 转为后台运行（不终止，只是标记）
-            self.task_manager.mark_background(
-                task.id, worker.process.pid if worker.process else 0
+        if sv_result.decision == Decision.ORCHESTRATE:
+            # 调用编排器重新审视任务列表
+            result = self.orchestrator.orchestrate(
+                trigger=f"Supervisor 决策: {sv_result.reason}",
+                context=f"任务 [{task.id}]: {task.description}"
             )
-            self.progress_log.log_background_start(
-                task.id, task.description, worker.process.pid if worker.process else 0
-            )
-            print(f"   🔄 任务已转为后台运行")
-            print(f"   👀 查看进度: tail -f {worker.log_file}")
-
-        elif sv_result.decision == Decision.INTERVENE:
-            # 需要人工介入
-            self.task_manager.mark_failed(
-                task.id, sv_result.suggestion or "需要人工介入"
-            )
-            self._guide_user_for_failure(task)
+            if result.success:
+                print(f"   ✅ 任务编排完成")
+                # 回退代码到任务开始前
+                if commit_before and self._git_reset_to(commit_before):
+                    print(f"   ✅ 已回退代码到: {commit_before[:8]}")
+            else:
+                print(f"   ⚠️  编排失败: {result.message}")
+                self.task_manager.mark_failed(task.id, f"编排失败: {result.message}")
 
     def _finalize_worker(
         self, task: Task, worker: WorkerProcess, commit_before: str = None
     ):
-        """处理 Worker 自然结束的情况"""
+        """处理 Worker 自然结束的情况 - 使用 Post-work 验证"""
         _ = commit_before  # 保留参数用于未来扩展
         log = worker.read_log()
 
@@ -606,37 +600,35 @@ echo "=== 初始化完成 ==="
         self.total_cost += log.cost_usd
         print(f"   💰 成本: ${log.cost_usd:.4f} | 总成本: ${self.total_cost:.4f}")
 
-        if log.is_complete and not log.is_error:
-            # 检查是否有完成标记
-            if log.result and "TASK_COMPLETED" in log.result:
-                print(f"   ✅ 任务完成!")
-                self.task_manager.mark_completed(task.id)
-                self.progress_log.log_complete(
-                    task.id, task.description, log.session_id, log.result or ""
-                )
-                self._git_commit(f"完成任务 [{task.id}]: {task.description}")
-            elif log.result and "TASK_BLOCKED" in log.result:
-                error = log.result.split("TASK_BLOCKED:")[-1].strip()[:100]
-                print(f"   ⏸️  任务被阻塞: {error}")
-                self.task_manager.mark_failed(task.id, error)
-                self.progress_log.log_blocked(
-                    task.id, task.description, log.session_id, error
-                )
-            else:
-                # 没有明确标记，假设完成
-                print(f"   ✅ 任务完成（无明确标记）")
-                self.task_manager.mark_completed(task.id)
-                self.progress_log.log_complete(
-                    task.id, task.description, log.session_id, log.result or ""
-                )
-                self._git_commit(f"完成任务 [{task.id}]: {task.description}")
-        else:
-            # 执行失败
+        # 检查 Worker 是否报告了阻塞或错误
+        if log.result and "TASK_BLOCKED" in log.result:
+            error = log.result.split("TASK_BLOCKED:")[-1].strip()[:100]
+            print(f"   ⏸️  任务被阻塞: {error}")
+            self.task_manager.update_notes(task.id, f"阻塞: {error}")
+            self.task_manager.mark_failed(task.id, error)
+            return
+
+        if log.is_error:
             error_msg = log.result[:200] if log.result else "执行失败"
-            print(f"   ❌ 任务失败: {error_msg[:50]}...")
+            print(f"   ❌ Worker 执行失败: {error_msg[:50]}...")
+            self.task_manager.update_notes(task.id, f"执行失败: {error_msg[:100]}")
             self.task_manager.mark_failed(task.id, error_msg)
-            self.progress_log.log_failed(
-                task.id, task.description, log.session_id, error_msg
+            return
+
+        # Post-work 验证阶段
+        print(f"\n   📋 Post-work 验证中...")
+        validator = PostWorkValidator(self.workspace_dir, self.task_manager)
+        result = validator.validate_and_commit(task)
+
+        if result.success:
+            print(f"   ✅ 任务完成!")
+            self.task_manager.mark_completed(task.id)
+        else:
+            # 验证失败，调用 Orchestrator
+            print(f"   🎭 验证未通过，调用 Orchestrator...")
+            self.orchestrator.orchestrate(
+                trigger=f"任务 [{task.id}] 验证失败",
+                context=f"任务描述: {task.description}\n错误: {'; '.join(result.errors)}"
             )
 
         # 清理 worker 日志（可选）
@@ -660,7 +652,7 @@ echo "=== 初始化完成 ==="
             }.get(task.status, "❓")
             print(f"  {status_icon} [{task.id}] {task.description}")
 
-        print("\n" + self.progress_log.get_summary())
+        print("\n" + self._get_git_context())
 
     def add_task_from_prompt(self, user_request: str):
         """根据用户自然语言描述生成并添加任务"""
@@ -674,16 +666,11 @@ echo "=== 初始化完成 ==="
         context_parts = []
         print("   📂 收集项目上下文...")
 
-        # 1. 读取 progress.md 获取历史
-        if os.path.exists(self.progress_file):
-            try:
-                with open(self.progress_file, "r", encoding="utf-8") as f:
-                    progress_content = f.read()[-2000:]  # 最近 2000 字符
-                    if progress_content.strip():
-                        context_parts.append(f"### 最近进度\n{progress_content}")
-                        print("      ✓ 读取 progress.md")
-            except:
-                pass
+        # 1. 读取 git log 获取历史
+        git_log = self._get_git_context()
+        if git_log and "暂无" not in git_log:
+            context_parts.append(f"### 最近 Git 提交\n{git_log}")
+            print("      \u2713 读取 git log")
 
         # 2. 获取现有任务描述
         existing_tasks = self.task_manager.get_all_tasks()
@@ -819,7 +806,7 @@ echo "=== 初始化完成 ==="
         """重置所有任务状态"""
         for task in self.task_manager.get_all_tasks():
             self.task_manager.reset_task(task.id)
-        self.progress_log.clear()
+        # 进度由 git 管理，无需清理
         print("✓ 所有任务已重置")
 
     def reset_single_task(self, task_id: str):
@@ -831,138 +818,6 @@ echo "=== 初始化完成 ==="
         else:
             print(f"❌ 未找到任务: {task_id}")
 
-    def check_background_tasks(self):
-        """检查后台任务状态"""
-        bg_tasks = self.task_manager.get_background_tasks()
-        if not bg_tasks:
-            print("\n没有正在运行的后台任务")
-            return
-
-        print("\n" + "=" * 60)
-        print("🔄 后台任务状态")
-        print("=" * 60)
-
-        for task in bg_tasks:
-            pid = task.background_pid
-            running = self._is_process_running(pid)
-            log_file = os.path.join(self.workspace_dir, f".worker_{task.id}.log")
-
-            status_icon = "🟢" if running else "⚪"
-            print(f"\n{status_icon} [{task.id}]: {task.description}")
-            print(f"   PID: {pid} ({'运行中' if running else '已结束'})")
-            print(f"   日志: {log_file}")
-
-            # 显示日志尾部
-            if os.path.exists(log_file):
-                print("   最近输出:")
-                try:
-                    with open(log_file, "r") as f:
-                        lines = f.readlines()[-5:]
-                        for line in lines:
-                            print(f"     {line.rstrip()[:80]}")
-                except:
-                    pass
-
-            # 如果进程已结束，更新状态
-            if not running:
-                self._finalize_background_task(task, log_file)
-
-    def _is_process_running(self, pid: int) -> bool:
-        """检查进程是否运行中"""
-        try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
-
-    def _finalize_background_task(self, task: Task, log_file: str):
-        """处理已完成的后台任务"""
-        import json as json_module
-
-        # 尝试从日志中解析结果（stream-json格式：每行一个JSON事件）
-        try:
-            with open(log_file, "r") as f:
-                content = f.read()
-                # 按行倒序查找 type=result 的事件
-                for line in reversed(content.strip().split("\n")):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json_module.loads(line)
-                        if event.get("type") == "result":
-                            if event.get("is_error"):
-                                task.status = "failed"
-                                task.error_message = event.get("result", "后台执行失败")
-                            else:
-                                task.status = "completed"
-                            task.background_pid = None
-                            self.task_manager.save_tasks()
-                            print(f"   ✅ 状态已更新为: {task.status}")
-                            return
-                    except json_module.JSONDecodeError:
-                        continue
-        except:
-            pass
-
-        # 无法解析，标记为需要检查
-        task.status = "pending"
-        task.background_pid = None
-        task.error_message = "后台执行结束，请检查日志确认结果"
-        self.task_manager.save_tasks()
-        print(f"   ⚠️  无法解析结果，任务已重置为pending")
-
-    def view_task_log(self, task_id: str, lines: int = 50):
-        """查看任务日志"""
-        log_file = os.path.join(self.workspace_dir, f".worker_{task_id}.log")
-        if not os.path.exists(log_file):
-            print(f"❌ 日志文件不存在: {log_file}")
-            return
-
-        print(f"\n📄 任务 [{task_id}] 日志 (最后 {lines} 行):")
-        print("-" * 50)
-        with open(log_file, "r") as f:
-            all_lines = f.readlines()
-            for line in all_lines[-lines:]:
-                print(line.rstrip())
-
-    def kill_background_task(self, task_id: str):
-        """终止后台任务"""
-        task = self.task_manager.get_task_by_id(task_id)
-        if not task:
-            print(f"❌ 未找到任务: {task_id}")
-            return
-
-        if not task.background_pid:
-            print(f"❌ 任务 [{task_id}] 不是后台任务")
-            return
-
-        pid = task.background_pid
-        try:
-            # 使用进程组终止，确保所有子进程也被终止
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGKILL)
-            print(f"✅ 已终止进程组 PGID {pgid}")
-        except ProcessLookupError:
-            print(f"⚠️  进程 {pid} 已不存在")
-        except OSError:
-            # 可能不是进程组 leader，尝试终止单个进程
-            try:
-                os.kill(pid, signal.SIGKILL)
-                print(f"✅ 已终止进程 PID {pid}")
-            except ProcessLookupError:
-                print(f"⚠️  进程 {pid} 已不存在")
-            except Exception as e:
-                print(f"❌ 终止进程失败: {e}")
-        except Exception as e:
-            print(f"❌ 终止进程失败: {e}")
-
-        # 重置任务状态
-        task.status = "pending"
-        task.background_pid = None
-        task.error_message = "后台任务被手动终止"
-        self.task_manager.save_tasks()
-        print(f"✅ 任务 [{task_id}] 已重置")
 
 
 def main():
@@ -1003,18 +858,6 @@ def main():
     reset_task_parser = subparsers.add_parser("reset-task", help="重置单个任务状态")
     reset_task_parser.add_argument("task_id", help="要重置的任务 ID")
 
-    # check-bg 命令
-    subparsers.add_parser("check-bg", help="检查后台任务状态")
-
-    # log 命令
-    log_parser = subparsers.add_parser("log", help="查看任务日志")
-    log_parser.add_argument("task_id", help="任务 ID")
-    log_parser.add_argument("-n", "--lines", type=int, default=50, help="显示的行数")
-
-    # kill-bg 命令
-    kill_parser = subparsers.add_parser("kill-bg", help="终止后台任务")
-    kill_parser.add_argument("task_id", help="任务 ID")
-
     # add 命令
     add_parser = subparsers.add_parser("add", help="根据描述新增任务")
     add_parser.add_argument("description", help="任务需求描述")
@@ -1041,12 +884,6 @@ def main():
         agent.reset()
     elif args.command == "reset-task":
         agent.reset_single_task(args.task_id)
-    elif args.command == "check-bg":
-        agent.check_background_tasks()
-    elif args.command == "log":
-        agent.view_task_log(args.task_id, args.lines)
-    elif args.command == "kill-bg":
-        agent.kill_background_task(args.task_id)
     elif args.command == "add":
         agent.add_task_from_prompt(args.description)
     else:

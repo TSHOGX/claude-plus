@@ -21,12 +21,7 @@ class Task:
     status: str = TaskStatus.PENDING
     session_id: Optional[str] = None
     error_message: Optional[str] = None
-    retries: int = 0
-    # 新增字段
-    parent_id: Optional[str] = None  # 父任务ID（分裂时）
-    timeout_snapshot: Optional[str] = None  # 超时快照
-    background_pid: Optional[int] = None  # 后台进程ID
-    estimated_duration: Optional[int] = None  # 预估时长（秒）
+    notes: Optional[str] = None  # 执行备注（失败原因等），供 Orchestrator 参考
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,20 +63,16 @@ class TaskManager:
                 [t.to_dict() for t in self.tasks], f, ensure_ascii=False, indent=2
             )
 
-    def get_next_task(self, max_retries: int = 2) -> Optional[Task]:
+    def get_next_task(self) -> Optional[Task]:
         """获取下一个待处理的任务（按优先级排序）
 
-        包括：pending、in_progress、以及失败但未超过重试次数的任务
-        排除：split（已分裂）、background（后台运行中）
+        只包括：pending 和 in_progress 的任务
+        失败任务由 Orchestrator 处理
         """
         eligible_tasks = [
             t
             for t in self.tasks
-            if (
-                t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
-                or (t.status == TaskStatus.FAILED and t.retries < max_retries)
-            )
-            and t.status not in ("split", "background")  # 排除特殊状态
+            if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
         ]
         if not eligible_tasks:
             return None
@@ -117,7 +108,6 @@ class TaskManager:
         if task:
             task.status = TaskStatus.FAILED
             task.error_message = error_message
-            task.retries += 1
             self.save_tasks()
 
     def reset_task(self, task_id: str):
@@ -126,8 +116,22 @@ class TaskManager:
         if task:
             task.status = TaskStatus.PENDING
             task.error_message = None
-            task.session_id = None  # 重置时清除 session_id
-            task.retries = 0  # 重置重试次数
+            task.session_id = None
+            task.notes = None
+            self.save_tasks()
+
+    def update_notes(self, task_id: str, notes: str):
+        """更新任务备注（用于记录失败原因等）"""
+        task = self.get_task_by_id(task_id)
+        if task:
+            task.notes = notes
+            self.save_tasks()
+
+    def clear_notes(self, task_id: str):
+        """清除任务备注（任务完成时调用）"""
+        task = self.get_task_by_id(task_id)
+        if task:
+            task.notes = None
             self.save_tasks()
 
     def add_task(self, task: Task):
@@ -135,42 +139,6 @@ class TaskManager:
         self.tasks.append(task)
         self.save_tasks()
 
-    def split_task(self, task_id: str, subtasks: List[dict]) -> bool:
-        """分裂任务为子任务，保留原任务记录"""
-        parent = self.get_task_by_id(task_id)
-        if not parent:
-            return False
-
-        # 标记父任务为已分裂（而非删除）
-        parent.status = "split"
-
-        # 创建子任务，关联父任务
-        for i, sub_data in enumerate(subtasks):
-            sub_task = Task(
-                id=sub_data.get("id", f"{task_id}_{i+1}"),
-                description=sub_data["description"],
-                priority=sub_data.get("priority", parent.priority + (i * 0.1)),
-                steps=sub_data.get("steps", []),
-                parent_id=task_id,
-                category=parent.category,
-            )
-            self.tasks.append(sub_task)
-
-        self.save_tasks()
-        return True
-
-    def mark_background(self, task_id: str, pid: int, estimated_duration: int = None):
-        """标记任务为后台运行中"""
-        task = self.get_task_by_id(task_id)
-        if task:
-            task.status = "background"
-            task.background_pid = pid
-            task.estimated_duration = estimated_duration
-            self.save_tasks()
-
-    def get_background_tasks(self) -> List[Task]:
-        """获取所有后台运行的任务"""
-        return [t for t in self.tasks if t.status == "background"]
 
     def get_stats(self) -> dict:
         """获取任务统计信息"""
@@ -180,8 +148,6 @@ class TaskManager:
             "in_progress": 0,
             "completed": 0,
             "failed": 0,
-            "split": 0,
-            "background": 0,
         }
         for task in self.tasks:
             if task.status in stats:

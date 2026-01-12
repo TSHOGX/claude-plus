@@ -4,7 +4,7 @@
 Supervisor 负责：
 - 定期检查 Worker 进度
 - 分析执行情况
-- 决策：继续等待 / 分裂任务 / 调整策略
+- 决策：继续等待 / 调用编排器
 """
 
 import subprocess
@@ -20,10 +20,8 @@ from config import CLAUDE_CMD
 class Decision(Enum):
     """Supervisor 决策"""
 
-    CONTINUE = "continue"  # 继续等待
-    SPLIT = "split"  # 任务太复杂，需要分裂
-    WAIT_BACKGROUND = "wait"  # 需要长时间等待（训练等），转后台
-    INTERVENE = "intervene"  # 需要人工介入
+    CONTINUE = "continue"      # 继续等待
+    ORCHESTRATE = "orchestrate" # 需要调用任务编排器
 
 
 @dataclass
@@ -32,45 +30,26 @@ class SupervisorResult:
 
     decision: Decision
     reason: str
-    subtasks: Optional[List[dict]] = None  # 如果是 SPLIT，包含子任务
-    suggestion: Optional[str] = None  # 如果是 INTERVENE，包含建议
 
 
-# Supervisor 分析提示模板（改进版）
-SUPERVISOR_PROMPT = """你是 Agent 执行监督者，负责分析 Worker 进度并做出决策。
+# Supervisor 分析提示模板 - 精简版
+SUPERVISOR_PROMPT = """你是 Agent 执行监督者。
 
 ## 任务信息
 - 描述: {task_description}
 - 已运行: {elapsed_time}
-- 检查次数: {check_count}
+- 日志文件: {log_file}
 
-## 执行流程
-{worker_summary}
+## 你的任务
+1. 阅读日志文件了解 Worker 执行情况
+2. 判断是否需要干预
 
-## 决策标准
-
-### continue（继续）- 默认选择
-- Agent 有新的工具调用或思考
-- 正在进行有意义的调试
-- 长时间操作有进展迹象（如训练 loss 在变化）
-
-### split（拆分）
-- 陷入循环（重复相同操作 5+ 次）
-- 任务范围明显过大
-- Agent 表示需要分步处理
-
-### wait（后台）
-- 执行长时间操作（训练/构建/下载）
-- 无需实时交互
-- 已设置等待进程完成
-
-### intervene（人工介入）
-- 遇到无法解决的阻塞
-- 需要用户凭证/确认/决策
-- 系统级错误（权限/网络等）
+## 决策选项
+- continue: Worker 在正常工作（有新进展、正在调试等）
+- orchestrate: 需要重新审视任务（陷入循环、任务太大、发现新问题、需要人工等）
 
 ## 输出 JSON
-{{"decision": "continue|split|wait|intervene", "reason": "简要原因（20字内）"}}
+{{"decision": "continue|orchestrate", "reason": "简要原因"}}
 """
 
 
@@ -94,12 +73,11 @@ class Supervisor:
         secs = int(elapsed % 60)
         elapsed_time = f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-        # 构建分析提示
+        # 构建分析提示 - 精简版，让 Claude Code 自己读日志
         prompt = SUPERVISOR_PROMPT.format(
             task_description=task.description,
-            worker_summary=worker_summary,
-            check_count=check_count,
             elapsed_time=elapsed_time,
+            log_file=worker.log_file,
         )
 
         if self.verbose:
@@ -157,29 +135,12 @@ class Supervisor:
 
             decision = {
                 "continue": Decision.CONTINUE,
-                "split": Decision.SPLIT,
-                "wait": Decision.WAIT_BACKGROUND,
-                "intervene": Decision.INTERVENE,
+                "orchestrate": Decision.ORCHESTRATE,
             }.get(decision_str, Decision.CONTINUE)
-
-            subtasks = None
-            if decision == Decision.SPLIT:
-                subtasks = data.get("subtasks", [])
-                # 验证子任务格式
-                if not subtasks or not isinstance(subtasks, list):
-                    return SupervisorResult(
-                        decision=Decision.CONTINUE, reason="分裂任务格式错误，继续等待"
-                    )
-
-            suggestion = (
-                data.get("suggestion") if decision == Decision.INTERVENE else None
-            )
 
             return SupervisorResult(
                 decision=decision,
                 reason=reason,
-                subtasks=subtasks,
-                suggestion=suggestion,
             )
 
         except json.JSONDecodeError:

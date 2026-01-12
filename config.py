@@ -19,7 +19,6 @@ def get_paths(workspace_dir: str = None):
     return {
         "workspace": ws,
         "tasks_file": os.path.join(ws, "tasks.json"),
-        "progress_file": os.path.join(ws, "progress.md"),
         "init_script": os.path.join(ws, "init.sh"),
     }
 
@@ -57,8 +56,8 @@ COMPLETION_MARKERS = {
     "error": "TASK_ERROR:",
 }
 
-# 系统提示模板
-SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务。你是一个专注、高效的开发代理。
+# Worker 系统提示模板 - 精简版
+SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务。
 
 ## 当前任务
 {task_description}
@@ -66,23 +65,17 @@ SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务。你是一�
 ## 任务步骤
 {task_steps}
 
-## 最近进度
-{recent_progress}
-
-## 工作目录
-{workspace_dir}
+## 开始前
+1. 阅读 CLAUDE.md 了解项目上下文和目标
+2. 运行 git log --oneline -5 了解最近进展
+3. 如果当前任务需要接续上次工作，查阅 tasks.json 中的 notes 字段
 
 ## 重要规则
 1. 只专注于当前任务，不要尝试完成其他任务
-2. 完成后明确报告 "TASK_COMPLETED" 表示成功
-3. 如果遇到阻塞，报告 "TASK_BLOCKED: <原因>"
-4. 如果遇到错误，报告 "TASK_ERROR: <错误描述>"
-5. 保持代码变更最小化
-6. 在工作目录下工作
+2. 完成后输出 TASK_COMPLETED
+3. 遇到阻塞输出 TASK_BLOCKED: <原因>
+4. 遇到错误输出 TASK_ERROR: <错误描述>
 """
-
-# 最大重试次数
-MAX_RETRIES = 2
 
 # 优雅退出配置
 GRACEFUL_SHUTDOWN_TIMEOUT = 60  # 清理会话最大时长（秒）
@@ -125,16 +118,7 @@ CLEANUP_PROMPT_TEMPLATE = """⚠️ 紧急通知：任务需要终止，请立�
 - 只需在输出中包含上述交接摘要，系统会自动处理
 """
 
-# 进度日志格式
-PROGRESS_ENTRY_FORMAT = """
----
-## [{timestamp}] Task: {task_id}
-**描述**: {description}
-**状态**: {status}
-**会话 ID**: {session_id}
-**详情**:
-{details}
-"""
+
 
 # 任务生成提示模板
 TASK_GENERATION_PROMPT = """根据用户需求，生成结构化的开发任务。
@@ -166,3 +150,28 @@ TASK_GENERATION_PROMPT = """根据用户需求，生成结构化的开发任务�
   {{"id": "xxx", "description": "...", "priority": N, "steps": ["...", "..."]}}
 ]
 ```"""
+
+# Post-work 验证提示模板 - 精简版
+POST_WORK_PROMPT = """你是代码审核员。任务 [{task_id}]: {task_description} 刚执行完毕。
+
+## 验证步骤
+1. 运行 git diff --stat 查看改动范围
+2. 进行基础检查：语法、测试、代码整洁度
+3. 根据判断决定是否可以提交
+
+## 输出格式
+验证通过:
+VALIDATION_PASSED
+COMMIT_MESSAGE_START
+Task [{task_id}]: <一句话摘要>
+
+<详细说明>
+COMMIT_MESSAGE_END
+
+需要修复: 直接修复问题后重新验证
+
+无法修复:
+VALIDATION_FAILED: <原因>
+"""
+
+

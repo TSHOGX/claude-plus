@@ -1,6 +1,18 @@
 # Claude Long-Running Agent
 
-基于 [Anthropic 博客](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) 思路实现的超长任务处理系统。
+一个 Claude Code 的上层任务编排框架，用于可控地执行复杂的长期项目。
+
+## 为什么需要这个？
+
+~~Just for fun~~
+
+Claude Code 是一个自由度很高的辅助编程工具，但在处理复杂项目时存在一些挑战：
+
+| 问题 | 本项目的解决方案 |
+|------|------------------|
+| **上下文爆炸** | 拆分为小任务，每个任务独立会话 |
+| **注意力缺失** | 单任务专注，避免因任务过多而简化执行 |
+| **关键步骤遗漏** | 强制执行 Workflow（测试、Git Commit） |
 
 ## 核心思想
 
@@ -8,21 +20,52 @@
 一个任务 = 一次 Claude 会话
 ```
 
-将复杂项目拆分为多个小任务，每个任务在单次 Claude 会话（10-15分钟）内完成，避免上下文溢出。
+将复杂项目拆分为多个小任务，每个任务在单次会话（10-15分钟）内完成。
 
 ## 架构
 
 ```
-┌─────────────────────────────────────────┐
-│              main.py                    │
-│           LongRunningAgent              │
-├─────────────────────────────────────────┤
-│  TaskManager   ProgressLog   Session    │
-│  (tasks.json)  (progress.md) Runner     │
-├─────────────────────────────────────────┤
-│           workspace/                    │
-│    你的代码 + tasks.json + progress.md  │
-└─────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│                       main.py                         │
+│                   LongRunningAgent                    │
+├───────────────────────────────────────────────────────┤
+│     TaskManager   Supervisor   Worker   Validator     │
+│                          ↓                            │
+│                     Orchestrator                      │
+├───────────────────────────────────────────────────────┤
+│                     workspace/                        │
+│          your codes + tasks.json + CLAUDE.md          │
+└───────────────────────────────────────────────────────┘
+```
+
+**模块职责：**
+| 模块 | 功能 |
+|------|------|
+| `TaskManager` | 任务状态管理（加载/保存/状态转换） |
+| `Worker` | 封装 Claude CLI 执行任务，输出日志解析 |
+| `Supervisor` | 定期检查 Worker 进度，判断是否需要干预 |
+| `Validator` | 任务完成后检查代码、运行测试、自动 commit |
+| `Orchestrator` | 任务失败超限时重新编排 tasks.json |
+
+**执行流程：**
+```mermaid
+flowchart TD
+    A[获取下一个任务] --> B[Worker 执行任务]
+    B --> C{Worker 结束?}
+    
+    C -->|否| D[Supervisor 检查]
+    D -->|继续| C
+    D -->|需干预| E[Orchestrator 重编排]
+    E --> A
+    
+    C -->|是| F[Validator 验证]
+    F -->|通过| G[Git Commit]
+    G --> H[标记任务完成]
+    H --> I{还有任务?}
+    I -->|是| A
+    I -->|否| J[完成]
+    
+    F -->|失败| E
 ```
 
 ## 快速开始
@@ -172,8 +215,8 @@ python3 main.py run
 
 | 文件 | 说明 |
 |------|------|
-| `tasks.json` | 任务列表（用户创建） |
-| `progress.md` | 进度日志（自动生成） |
+| `tasks.json` | 任务列表（用户创建或 AI 生成） |
+| `CLAUDE.md` | 项目上下文说明（用户创建） |
 | `init.sh` | 初始化脚本（自动生成） |
 
 ## 任务编写规范
@@ -191,6 +234,26 @@ python3 main.py run
 编辑 `config.py`：
 
 ```python
-SESSION_TIMEOUT = 900  # 任务超时时间（秒）
-MAX_RETRIES = 2        # 最大重试次数
+CHECK_INTERVAL = 300  # Supervisor 检查间隔（秒）
 ```
+
+> Supervisor 会智能判断任务执行状态，不设硬性超时上限。
+
+## 局限性
+
+- 相比原生 Claude Code，自由度有所降低
+- 任务拆分粒度需要人工或 AI 预先设计
+- 跨任务的复杂状态依赖当前主要靠 Git 和 `task.notes`
+
+## 未来方向
+
+- **交互式需求细化**：从模糊描述出发，对话式讨论并生成任务计划
+- **更智能的任务编排**：Orchestrator 自动识别依赖、动态拆分
+- **可视化执行面板**：实时查看任务状态、日志、成本
+- **插件化 Workflow**：支持自定义验证步骤（Lint、类型检查、集成测试）
+
+---
+
+## 参考与致谢
+
+本项目受 [Anthropic 博客: Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) 启发，在此基础上进行了大量改进和扩展。
