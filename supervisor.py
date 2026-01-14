@@ -64,9 +64,6 @@ class Supervisor:
         self, task: Task, worker: WorkerProcess, check_count: int = 0, elapsed: float = 0
     ) -> SupervisorResult:
         """分析 Worker 执行情况并做出决策"""
-        # 获取 Worker 日志摘要
-        worker_summary = worker.get_log_summary()
-
         # 格式化运行时长
         hours = int(elapsed // 3600)
         minutes = int((elapsed % 3600) // 60)

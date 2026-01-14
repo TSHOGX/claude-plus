@@ -50,22 +50,28 @@ Claude Code 是一个自由度很高的辅助编程工具，但在处理复杂�
 **执行流程：**
 ```mermaid
 flowchart TD
-    A[获取下一个任务] --> B[Worker 执行任务]
-    B --> C{Worker 结束?}
-    
-    C -->|否| D[Supervisor 检查]
-    D -->|继续| C
-    D -->|需干预| E[Orchestrator 重编排]
-    E --> A
-    
-    C -->|是| F[Validator 验证]
-    F -->|通过| G[Git Commit]
-    G --> H[标记任务完成]
-    H --> I{还有任务?}
-    I -->|是| A
-    I -->|否| J[完成]
-    
-    F -->|失败| E
+    A[循环开始] --> B{有失败任务?}
+
+    B -->|是| C{重试次数 < 3?}
+    C -->|是| D[Orchestrator 处理失败任务]
+    D --> A
+    C -->|否| E[打印失败详情并退出]
+
+    B -->|否| F[获取下一个 pending 任务]
+    F --> G{有任务?}
+    G -->|否| H[完成]
+
+    G -->|是| I[Worker 执行任务]
+    I --> J{Worker 结束?}
+
+    J -->|否| K[Supervisor 检查]
+    K -->|继续| J
+    K -->|需干预| D
+
+    J -->|是| L[Validator 验证]
+    L -->|通过| M[Git Commit + 标记完成]
+    M --> A
+    L -->|失败| D
 ```
 
 ## 快速开始
@@ -194,11 +200,14 @@ python3 main.py reset-task <task_id>
 
 ## 失败处理
 
-### 超时失败
-系统自动将任务拆分为更小的子任务，回退 Git 后重新执行。
+任务失败后，系统会在**下一轮循环立即调用 Orchestrator** 处理（最多重试 3 次）：
 
-### 其他失败
-显示详细指导信息，用户手动修复后：
+1. **重试**：将任务状态改回 `pending`
+2. **修改后重试**：调整任务描述/步骤后重试
+3. **拆分**：将复杂任务拆分为多个小任务
+4. **删除**：如果任务不再需要
+
+如果 3 次后仍有未解决的失败任务，系统会打印详情并退出，需要手动处理：
 ```bash
 python3 main.py reset-task 001
 python3 main.py run

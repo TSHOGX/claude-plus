@@ -362,6 +362,23 @@ class LongRunningAgent:
             lines.append(f"- [{t.id}] {t.description}: {t.error_message or '未知错误'}")
         return "\n".join(lines)
 
+    def _print_failed_tasks_detail(self):
+        """打印失败任务详情（供用户排查）"""
+        from config import TaskStatus
+        failed = [t for t in self.task_manager.get_all_tasks() if t.status == TaskStatus.FAILED]
+        if not failed:
+            return
+        print("\n" + "─" * 50)
+        print("❌ 未解决的失败任务:")
+        for t in failed:
+            print(f"   [{t.id}] {t.description}")
+            if t.error_message:
+                print(f"        错误: {t.error_message[:100]}")
+            if t.notes:
+                print(f"        备注: {t.notes[:100]}")
+        print("─" * 50)
+        print("建议: 手动编辑 tasks.json 或使用 'python3 main.py reset-task <id>' 重置")
+
     def run(self, max_tasks: int = None):
         """运行主循环处理任务（Supervisor-Worker 架构）"""
         import time
@@ -381,6 +398,8 @@ class LongRunningAgent:
         tasks_processed = 0
         current_worker = None
         commit_before_task = None
+        failed_task_retries = 0  # 失败任务处理重试计数
+        MAX_FAILED_RETRIES = 3   # 最大重试次数
 
         try:
             while True:
@@ -389,17 +408,30 @@ class LongRunningAgent:
                     print(f"\n已达到最大任务数限制: {max_tasks}")
                     break
 
+                # 优先处理失败任务：在获取下一个任务之前，检查是否有失败任务
+                if self._has_failed_tasks():
+                    if failed_task_retries >= MAX_FAILED_RETRIES:
+                        print(f"\n⚠️  Orchestrator 已尝试 {MAX_FAILED_RETRIES} 次处理失败任务，仍有未解决的失败任务")
+                        print("   请手动检查 tasks.json 中的 failed 任务")
+                        self._print_failed_tasks_detail()
+                        break
+
+                    failed_task_retries += 1
+                    print(f"\n🎭 检测到失败任务，调用 Orchestrator 处理 (尝试 {failed_task_retries}/{MAX_FAILED_RETRIES})...")
+                    self.orchestrator.orchestrate(
+                        trigger="检测到失败任务，立即处理",
+                        context=self._get_failed_tasks_summary()
+                    )
+                    # Orchestrator 处理后重新加载任务（可能已将 failed 改为 pending 或删除）
+                    self.task_manager._load_tasks()
+                    continue  # 重新检查是否还有失败任务
+                else:
+                    # 没有失败任务时重置计数器
+                    failed_task_retries = 0
+
                 # 获取下一个任务
                 task = self.task_manager.get_next_task()
                 if not task:
-                    # 检查是否有失败任务需要编排
-                    if self._has_failed_tasks():
-                        print("\n🎭 有失败任务，调用 Orchestrator 重新审视...")
-                        self.orchestrator.orchestrate(
-                            trigger="所有可执行任务完成，但有失败任务需要处理",
-                            context=self._get_failed_tasks_summary()
-                        )
-                        continue
                     print("\n✅ 所有任务已完成!")
                     break
 

@@ -35,6 +35,15 @@ ORCHESTRATOR_PROMPT = """你是任务编排者。需要重新审视和调整任�
    - 可以删除不再需要的 pending 任务
 5. 直接编辑 tasks.json 文件
 
+## 处理失败任务 (status=failed)
+对于失败的任务，你必须采取以下其一：
+1. **重试**: 将 status 改为 "pending"，清除 error_message（如果是临时性问题）
+2. **修改后重试**: 修改任务的 description/steps 后，将 status 改为 "pending"
+3. **拆分**: 将复杂任务拆分为多个小任务，删除原任务
+4. **删除**: 如果任务不再需要，直接删除
+
+重要：不能让 failed 任务保持 failed 状态，必须处理！
+
 ## 约束
 - 任务粒度适中（单任务 10-15 分钟内可完成）
 - 保持 id 唯一
@@ -165,35 +174,68 @@ class TaskOrchestrator:
             capture_output=True
         )
 
-    def _call_claude(self, prompt: str, timeout: int = 120) -> Optional[str]:
-        """调用 Claude Code"""
+    def _call_claude(self, prompt: str) -> Optional[str]:
+        """调用 Claude Code（流式输出，无超时）"""
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [
                     CLAUDE_CMD,
                     "-p",
-                    "--output-format", "json",
+                    "--output-format", "stream-json",
                     "--dangerously-skip-permissions",
                     prompt,
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 cwd=self.workspace_dir,
             )
 
-            if result.returncode != 0:
+            full_result = ""
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "assistant" and self.verbose:
+                        # 显示思考过程
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                preview = text[:60].replace("\n", " ")
+                                if preview:
+                                    print(f"      💭 {preview}...")
+
+                    elif evt_type == "content_block_start" and self.verbose:
+                        # 工具调用开始
+                        cb = event.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            tool_name = cb.get("name", "")
+                            print(f"      🔧 {tool_name}")
+
+                    elif evt_type == "result":
+                        full_result = event.get("result", "")
+                        cost = event.get("total_cost_usd", 0)
+                        if self.verbose:
+                            print(f"      💰 成本: ${cost:.4f}")
+
+                except json.JSONDecodeError:
+                    continue
+
+            process.wait()
+
+            if process.returncode != 0:
+                stderr = process.stderr.read()
                 if self.verbose:
-                    print(f"   ⚠️  Claude 调用失败: {result.stderr[:100]}")
+                    print(f"   ⚠️  Claude 调用失败: {stderr[:100]}")
                 return None
 
-            output_data = json.loads(result.stdout)
-            return output_data.get("result", "")
+            return full_result
 
-        except subprocess.TimeoutExpired:
-            if self.verbose:
-                print("   ⚠️  Claude 调用超时")
-            return None
         except Exception as e:
             if self.verbose:
                 print(f"   ⚠️  Claude 调用异常: {e}")
