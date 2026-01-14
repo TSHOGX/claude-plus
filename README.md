@@ -52,48 +52,44 @@ Claude Code 是一个自由度很高的辅助编程工具，但在处理复杂�
 flowchart TD
     A[循环开始] --> B{有失败任务?}
 
-    B -->|是| C{重试次数 < 3?}
-    C -->|是| D[Orchestrator 处理失败任务]
+    B -->|是| C{重试 < 3?}
+    C -->|是| D[Orchestrator 重编排]
     D --> A
-    C -->|否| E[打印失败详情并退出]
+    C -->|否| E[退出，需人工处理]
 
     B -->|否| F[获取下一个 pending 任务]
     F --> G{有任务?}
-    G -->|否| H[完成]
+    G -->|否| H[全部完成]
 
-    G -->|是| I[Worker 执行任务]
-    I --> J{Worker 结束?}
+    G -->|是| I[Worker 执行]
+    I --> J{运行中}
 
-    J -->|否| K[Supervisor 检查]
+    J -->|定时| K[Supervisor 异步分析]
     K -->|继续| J
-    K -->|需干预| D
+    K -->|编排| D
 
-    J -->|是| L[Validator 验证]
-    L -->|通过| M[Git Commit + 标记完成]
+    J -->|自然结束| L{Worker 状态}
+    L -->|报错/阻塞| M[标记失败]
     M --> A
-    L -->|失败| D
+    L -->|正常| N[Validator 验证]
+    N -->|通过| O[Commit + 完成]
+    O --> A
+    N -->|失败| D
 ```
 
 ## 快速开始
 
-### 1. 准备工作目录
+### 1. 初始化并生成任务
 
 ```bash
-# 在现有项目中使用
+# 初始化 + 自动生成任务（推荐）
+python3 main.py -w ~/my-project init "实现一个博客系统，包含文章管理和用户认证"
+
+# 仅初始化（不生成任务）
 python3 main.py -w ~/my-project init
-
-# 或使用默认目录
-python3 main.py init
 ```
 
-### 2. 创建任务文件
-
-**方式一：使用 AI 生成任务**
-```bash
-python3 main.py -w ~/my-project add "实现用户登录功能，包括注册和密码加密"
-```
-
-**方式二：手动创建 tasks.json**
+### 2. 或手动创建任务文件
 
 ```json
 [
@@ -129,10 +125,10 @@ python3 main.py -w ~/my-project status
 
 | 命令 | 说明 |
 |------|------|
-| `init` | 初始化工作环境，创建 Git 快照保护现有代码 |
+| `init [描述]` | 初始化环境；可选提供需求描述，自动生成 tasks.json |
 | `run` | 运行任务处理 |
 | `status` | 显示当前状态 |
-| `add "描述"` | 根据自然语言描述新增任务 |
+| `add "描述"` | 根据自然语言描述追加任务到现有列表 |
 | `reset` | 重置所有任务 |
 | `reset-task <id>` | 重置单个任务 |
 
@@ -242,7 +238,7 @@ python3 main.py run
 编辑 `config.py`：
 
 ```python
-CHECK_INTERVAL = 600  # Supervisor 检查间隔（秒）
+CHECK_INTERVAL = 1500  # Supervisor 检查间隔（秒），默认 25 分钟
 ```
 
 > Supervisor 会智能判断任务执行状态，不设硬性超时上限。
