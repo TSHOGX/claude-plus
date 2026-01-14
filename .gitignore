@@ -34,7 +34,6 @@ venv.bak/
 workspace/
 tasks.json
 progress.md
-init.sh
 
 # IDE
 .vscode/

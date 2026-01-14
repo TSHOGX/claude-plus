@@ -217,7 +217,6 @@ python3 main.py run
 |------|------|
 | `tasks.json` | 任务列表（用户创建或 AI 生成） |
 | `CLAUDE.md` | 项目上下文说明（用户创建） |
-| `init.sh` | 初始化脚本（自动生成） |
 
 ## 任务编写规范
 
@@ -234,7 +233,7 @@ python3 main.py run
 编辑 `config.py`：
 
 ```python
-CHECK_INTERVAL = 300  # Supervisor 检查间隔（秒）
+CHECK_INTERVAL = 600  # Supervisor 检查间隔（秒）
 ```
 
 > Supervisor 会智能判断任务执行状态，不设硬性超时上限。

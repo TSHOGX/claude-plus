@@ -15,6 +15,8 @@ import sys
 import signal
 import argparse
 import subprocess
+import threading
+from queue import Queue, Empty
 from datetime import datetime
 
 from config import (
@@ -24,11 +26,12 @@ from config import (
     is_safe_workspace,
     CLAUDE_CMD,
     TASK_GENERATION_PROMPT,
+    TASKS_CREATION_PROMPT,
 )
 from task_manager import TaskManager, Task
 # progress_log 已弃用，进度通过 git commit 和 task.notes 追踪
 from worker import WorkerProcess
-from supervisor import Supervisor, Decision
+from supervisor import Supervisor, Decision, SupervisorResult
 from validator import PostWorkValidator
 from orchestrator import TaskOrchestrator
 
@@ -41,7 +44,6 @@ class LongRunningAgent:
         self.paths = get_paths(workspace_dir)
         self.workspace_dir = self.paths["workspace"]
         self.tasks_file = self.paths["tasks_file"]
-        self.init_script = self.paths["init_script"]
         self.verbose = verbose
 
         # 初始化组件（使用动态路径）
@@ -77,11 +79,10 @@ class LongRunningAgent:
             if self._has_uncommitted_changes():
                 print("⚠️  检测到未提交的更改，建议先手动提交")
 
-        # 3. 创建初始化脚本
-        self._create_init_script()
-        print(f"✓ 初始化脚本: {self.init_script}")
+        # 确保 .claude_plus/ 在 .gitignore 中
+        self._ensure_gitignore_entry(".claude_plus/")
 
-        # 4. 检查任务文件（不自动创建）
+        # 3. 检查任务文件（不自动创建）
         if not os.path.exists(self.tasks_file):
             print(f"\n⚠️  任务文件不存在: {self.tasks_file}")
             print("\n请创建 tasks.json 文件，格式如下：")
@@ -113,6 +114,27 @@ class LongRunningAgent:
         self._print_stats()
         return True
 
+    def _ensure_gitignore_entry(self, entry: str):
+        """确保 .gitignore 中包含指定条目"""
+        gitignore_path = os.path.join(self.workspace_dir, ".gitignore")
+
+        # 读取现有内容
+        existing_entries = set()
+        if os.path.exists(gitignore_path):
+            with open(gitignore_path, "r") as f:
+                existing_entries = {line.strip() for line in f if line.strip()}
+
+        # 如果已存在则跳过
+        if entry in existing_entries:
+            return
+
+        # 追加新条目
+        with open(gitignore_path, "a") as f:
+            if existing_entries:  # 文件非空时先加换行
+                f.write("\n")
+            f.write(f"{entry}\n")
+        print(f"✓ 已添加 {entry} 到 .gitignore")
+
     def _count_files(self) -> int:
         """统计 workspace 中的文件数量（不包括隐藏文件）"""
         count = 0
@@ -131,33 +153,6 @@ class LongRunningAgent:
             text=True,
         )
         return bool(result.stdout.strip())
-
-    def _create_init_script(self):
-        """创建初始化脚本"""
-        script_content = """#!/bin/bash
-# 初始化脚本 - 每次会话开始时运行
-
-echo "=== 环境初始化 ==="
-
-# 确认工作目录
-echo "工作目录: $(pwd)"
-
-# 显示 Git 状态
-echo ""
-echo "=== Git 状态 ==="
-git status --short
-
-# 显示最近的提交
-echo ""
-echo "=== 最近提交 ==="
-git log --oneline -5 2>/dev/null || echo "暂无提交"
-
-echo ""
-echo "=== 初始化完成 ==="
-"""
-        with open(self.init_script, "w") as f:
-            f.write(script_content)
-        os.chmod(self.init_script, 0o755)
 
     def _git_commit(self, message: str):
         """执行 Git 提交"""
@@ -429,11 +424,15 @@ echo "=== 初始化完成 ==="
                 print(f"   🚀 Worker 启动: PID {pid}")
                 print(f"   📄 日志: {worker.log_file}")
 
-                # 监督循环 - 实时显示日志，定期调用 supervisor
+                # 监督循环 - 实时显示日志，后台异步执行 supervisor
                 check_count = 0
                 decision_made = False
                 last_supervisor_time = time.time()
                 REALTIME_INTERVAL = 2  # 实时日志检查间隔（秒）
+
+                # 后台 Supervisor 结果队列
+                supervisor_queue = Queue()
+                supervisor_thread = None
 
                 print()  # 空行，准备实时输出
 
@@ -447,31 +446,58 @@ echo "=== 初始化完成 ==="
                     for evt in new_events:
                         self._print_realtime_event(evt, elapsed_str)
 
-                    # 检查是否到达 supervisor 检查时间
+                    # 检查后台 Supervisor 是否有结果
+                    try:
+                        while True:
+                            sv_result, sv_check_count, sv_elapsed = supervisor_queue.get_nowait()
+                            sv_elapsed_str = self._format_duration(sv_elapsed)
+                            # 显示 Supervisor 检查结果（不阻塞日志输出）
+                            print(f"\n   {'─' * 40}")
+                            print(f"   🔍 [{sv_elapsed_str}] Supervisor 检查 #{sv_check_count} 完成")
+                            print(
+                                f"      📋 决策: \033[1m{sv_result.decision.value}\033[0m | {sv_result.reason}"
+                            )
+                            print(f"   {'─' * 40}\n")
+
+                            if sv_result.decision != Decision.CONTINUE:
+                                self._handle_supervisor_decision(
+                                    task, worker, sv_result, commit_before_task
+                                )
+                                decision_made = True
+                                break
+                    except Empty:
+                        pass
+
+                    if decision_made:
+                        break
+
+                    # 检查是否到达 supervisor 检查时间，且没有正在运行的检查
                     time_since_last_check = time.time() - last_supervisor_time
-                    if time_since_last_check >= CHECK_INTERVAL:
+                    if time_since_last_check >= CHECK_INTERVAL and (supervisor_thread is None or not supervisor_thread.is_alive()):
                         check_count += 1
                         last_supervisor_time = time.time()
+                        current_elapsed = elapsed
 
-                        # Supervisor 检查分隔线
-                        print(f"\n   {'─' * 40}")
-                        print(f"   🔍 [{elapsed_str}] Supervisor 检查 #{check_count}")
+                        # 显示开始检查的提示
+                        print(f"\n   \033[90m🔍 [{elapsed_str}] Supervisor 检查 #{check_count} 启动中...\033[0m")
 
-                        # 调用 Supervisor 分析
-                        sv_result = self.supervisor.analyze(
-                            task, worker, check_count, elapsed
+                        # 在后台线程中执行 Supervisor 分析
+                        def run_supervisor(task, worker, check_count, elapsed, queue):
+                            try:
+                                sv_result = self.supervisor.analyze(
+                                    task, worker, check_count, elapsed
+                                )
+                                queue.put((sv_result, check_count, elapsed))
+                            except Exception as e:
+                                # 分析失败时返回继续等待
+                                queue.put((SupervisorResult(decision=Decision.CONTINUE, reason=f"分析失败: {e}"), check_count, elapsed))
+
+                        supervisor_thread = threading.Thread(
+                            target=run_supervisor,
+                            args=(task, worker, check_count, current_elapsed, supervisor_queue),
+                            daemon=True
                         )
-                        print(
-                            f"      📋 决策: \033[1m{sv_result.decision.value}\033[0m | {sv_result.reason}"
-                        )
-                        print(f"   {'─' * 40}\n")
-
-                        if sv_result.decision != Decision.CONTINUE:
-                            self._handle_supervisor_decision(
-                                task, worker, sv_result, commit_before_task
-                            )
-                            decision_made = True
-                            break
+                        supervisor_thread.start()
 
                 # Worker 自然结束
                 if not decision_made:
@@ -818,6 +844,157 @@ echo "=== 初始化完成 ==="
         else:
             print(f"❌ 未找到任务: {task_id}")
 
+    def create_tasks_from_prompt(self, user_request: str) -> bool:
+        """根据用户需求，让 Claude 生成 tasks.json"""
+        import json as json_module
+
+        print("\n" + "=" * 60)
+        print("🤖 Claude 正在分析项目并生成任务...")
+        print("=" * 60)
+
+        # 检查 tasks.json 是否已存在
+        if os.path.exists(self.tasks_file):
+            print(f"\n⚠️  tasks.json 已存在: {self.tasks_file}")
+            confirm = input("是否覆盖？(y/N): ").strip().lower()
+            if confirm != 'y':
+                print("已取消")
+                return False
+
+        # 构建 prompt（TASKS_GUIDE 规范已嵌入模板）
+        prompt = TASKS_CREATION_PROMPT.format(user_request=user_request)
+
+        # 调用 Claude Code（在 workspace 目录下）
+        result = self._call_claude_for_creation(prompt)
+
+        if result and "TASKS_CREATED" in result:
+            # 校验生成的 tasks.json
+            if self._validate_tasks_json():
+                print("\n✅ tasks.json 生成成功！")
+
+                # 显示生成的任务列表
+                self._show_generated_tasks()
+
+                # 询问用户是否提交
+                confirm_commit = input("\n是否提交到 Git？(y/N): ").strip().lower()
+                if confirm_commit == 'y':
+                    self._git_commit("初始化任务列表")
+                    print("✅ 已提交")
+                else:
+                    print("ℹ️  未提交，你可以稍后手动提交")
+
+                return True
+            else:
+                print("\n❌ 生成的 tasks.json 格式无效")
+                return False
+        else:
+            print("\n❌ 任务生成失败")
+            return False
+
+    def _show_generated_tasks(self):
+        """显示生成的任务列表"""
+        import json as json_module
+        try:
+            with open(self.tasks_file, "r", encoding="utf-8") as f:
+                tasks = json_module.load(f)
+
+            print("\n📋 生成的任务列表:")
+            print("-" * 40)
+            for t in tasks:
+                print(f"  [{t.get('id', '?')}] {t.get('description', '')}")
+                if t.get('steps'):
+                    for step in t['steps'][:2]:  # 只显示前两个步骤
+                        print(f"      - {step}")
+                    if len(t.get('steps', [])) > 2:
+                        print(f"      ... 共 {len(t['steps'])} 个步骤")
+            print("-" * 40)
+            print(f"共 {len(tasks)} 个任务")
+        except Exception:
+            pass
+
+    def _call_claude_for_creation(self, prompt: str, timeout: int = 180):
+        """调用 Claude Code 生成任务（流式输出）"""
+        import json as json_module
+        try:
+            process = subprocess.Popen(
+                [
+                    CLAUDE_CMD,
+                    "-p",
+                    "--verbose",
+                    "--output-format", "stream-json",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=self.workspace_dir,
+            )
+
+            full_result = ""
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json_module.loads(line)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "assistant":
+                        # 显示思考过程摘要
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                preview = text[:60].replace("\n", " ")
+                                if preview:
+                                    print(f"   💭 {preview}...")
+
+                    elif evt_type == "result":
+                        full_result = event.get("result", "")
+                        cost = event.get("total_cost_usd", 0)
+                        print(f"\n   💰 成本: ${cost:.4f}")
+
+                except json_module.JSONDecodeError:
+                    continue
+
+            process.wait(timeout=timeout)
+            return full_result
+
+        except Exception as e:
+            print(f"❌ 调用失败: {e}")
+            return None
+
+    def _validate_tasks_json(self) -> bool:
+        """校验 tasks.json 格式"""
+        import json as json_module
+        try:
+            with open(self.tasks_file, "r", encoding="utf-8") as f:
+                data = json_module.load(f)
+
+            if not isinstance(data, list):
+                print("   ⚠️  tasks.json 应该是一个数组")
+                return False
+
+            # 检查 ID 唯一性
+            ids = [t.get("id") for t in data if "id" in t]
+            if len(ids) != len(set(ids)):
+                print("   ⚠️  存在重复的任务 ID")
+                return False
+
+            # 检查必填字段
+            for task in data:
+                if "id" not in task or "description" not in task:
+                    print("   ⚠️  任务缺少必填字段 (id/description)")
+                    return False
+
+            return True
+        except json_module.JSONDecodeError as e:
+            print(f"   ⚠️  JSON 解析失败: {e}")
+            return False
+        except Exception as e:
+            print(f"   ⚠️  校验异常: {e}")
+            return False
+
 
 
 def main():
@@ -840,7 +1017,13 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
     # init 命令
-    subparsers.add_parser("init", help="初始化工作环境")
+    init_parser = subparsers.add_parser("init", help="初始化工作环境")
+    init_parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="可选：描述项目需求，Claude 将自动生成 tasks.json"
+    )
 
     # run 命令
     run_parser = subparsers.add_parser("run", help="运行任务处理")
@@ -876,6 +1059,9 @@ def main():
 
     if args.command == "init":
         agent.initialize()
+        # 如果提供了 prompt，生成 tasks.json
+        if args.prompt:
+            agent.create_tasks_from_prompt(args.prompt)
     elif args.command == "run":
         agent.run(max_tasks=args.max_tasks)
     elif args.command == "status":

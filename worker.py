@@ -51,8 +51,11 @@ class WorkerProcess:
         self.task = task
         self.workspace_dir = workspace_dir
         self.process: Optional[subprocess.Popen] = None
+        # 日志目录：.claude_plus/logs/
+        self.logs_dir = os.path.join(workspace_dir, ".claude_plus", "logs")
+        os.makedirs(self.logs_dir, exist_ok=True)
         # 日志文件名使用 task id
-        self.log_file = os.path.join(workspace_dir, f".worker_{task.id}.log")
+        self.log_file = os.path.join(self.logs_dir, f"worker_{task.id}.log")
         self.start_time: Optional[float] = None
         # 实时日志追踪
         self._last_log_position: int = 0

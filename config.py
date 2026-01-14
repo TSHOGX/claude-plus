@@ -19,7 +19,6 @@ def get_paths(workspace_dir: str = None):
     return {
         "workspace": ws,
         "tasks_file": os.path.join(ws, "tasks.json"),
-        "init_script": os.path.join(ws, "init.sh"),
     }
 
 
@@ -37,7 +36,7 @@ def is_safe_workspace(path: str) -> tuple[bool, str]:
 CLAUDE_CMD = "claude"
 
 # Supervisor 配置
-CHECK_INTERVAL = 300  # Supervisor 检查间隔（秒），默认 5 分钟
+CHECK_INTERVAL = 600  # Supervisor 检查间隔（秒），默认 10 分钟
 # MAX_TASK_DURATION 已移除 - 改为由 Supervisor 智能判断，不设硬性上限
 
 
@@ -151,21 +150,92 @@ TASK_GENERATION_PROMPT = """根据用户需求，生成结构化的开发任务�
 ]
 ```"""
 
-# Post-work 验证提示模板 - 精简版
+# 任务创建提示模板（用于 init 命令生成 tasks.json）
+TASKS_CREATION_PROMPT = """你是任务规划师。根据用户需求，为项目创建初始任务列表。
+
+## 用户需求
+{user_request}
+
+## 你的任务
+1. 探索当前目录，了解项目结构和现有代码
+2. 如果用户提到了参考文件（如 todo.md、spec.md），读取它们
+3. 根据理解，按照下面的规范创建 tasks.json 文件
+
+## tasks.json 规范
+
+### 核心思想
+一个任务 = 一次 Claude 会话
+任务粒度应该足够小，让 Claude 在单次会话（10-15分钟）内完成，避免上下文溢出。
+
+### 结构定义
+```json
+[
+  {{
+    "id": "001",                          // 必填：唯一标识符
+    "description": "实现用户登录功能",      // 必填：一句话描述任务目标
+    "priority": 1,                         // 必填：执行优先级（数字越小越优先）
+    "category": "feature",                 // 可选：分类（core/feature/bugfix/refactor）
+    "steps": [                             // 必填：具体执行步骤
+      "创建 auth.py 文件",
+      "实现 login(username, password) 函数",
+      "添加密码验证逻辑"
+    ]
+  }}
+]
+```
+
+### 编写原则
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| **单一职责** | 每个任务只做一件事 | ✅ "创建数据模型" ❌ "创建模型并实现所有API" |
+| **明确边界** | 指明文件路径和函数名 | ✅ "在 utils.py 中添加 format_date()" |
+| **依赖顺序** | 用 priority 控制执行顺序 | 模型(1) → CRUD(2-5) → 界面(6) |
+| **可验证** | steps 应能检验完成情况 | "添加单元测试" / "函数应返回 True/False" |
+
+### 任务分解示例
+项目：博客系统
+
+```json
+[
+  {{"id": "001", "priority": 1, "category": "core",
+    "description": "创建 Post 数据模型",
+    "steps": ["创建 models/post.py", "定义 Post 类", "添加序列化方法"]}},
+
+  {{"id": "002", "priority": 2, "category": "feature",
+    "description": "实现文章存储功能",
+    "steps": ["创建 PostManager 类", "实现 save_post()", "JSON 持久化"]}},
+
+  {{"id": "003", "priority": 3, "category": "feature",
+    "description": "实现文章列表功能",
+    "steps": ["添加 list_posts()", "支持分页", "按时间倒序"]}}
+]
+```
+
+## 输出
+1. 直接创建 tasks.json 文件
+2. 完成后输出 TASKS_CREATED
+"""
+
+# Post-work 验证提示模板 - 包含自主测试
 POST_WORK_PROMPT = """你是代码审核员。任务 [{task_id}]: {task_description} 刚执行完毕。
 
 ## 验证步骤
 1. 运行 git diff --stat 查看改动范围
-2. 进行基础检查：语法、测试、代码整洁度
-3. 根据判断决定是否可以提交
+2. 语法检查：确保代码无语法错误
+3. 单元测试：
+   - 如果有现成测试，运行 pytest
+   - 如果没有测试文件但改动了核心逻辑，编写简单测试验证功能
+4. 端到端测试（如适用）：
+   - Web 应用：启动服务，用 curl 或脚本验证关键端点
+   - CLI 工具：运行命令验证输出
+   - API：调用接口验证返回值
+5. 测试通过后，根据判断决定是否可以提交
 
 ## 输出格式
 验证通过:
 VALIDATION_PASSED
 COMMIT_MESSAGE_START
-Task [{task_id}]: <一句话摘要>
-
-<详细说明>
+<编写高质量的 commit message，遵循 conventional commits 或项目既有风格>
 COMMIT_MESSAGE_END
 
 需要修复: 直接修复问题后重新验证

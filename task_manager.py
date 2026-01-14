@@ -48,7 +48,14 @@ class TaskManager:
             try:
                 with open(self.tasks_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.tasks = [Task.from_dict(t) for t in data]
+                    # 支持两种格式：直接列表 或 {"tasks": [...]} 嵌套结构
+                    if isinstance(data, list):
+                        task_list = data
+                    elif isinstance(data, dict) and "tasks" in data:
+                        task_list = data["tasks"]
+                    else:
+                        task_list = []
+                    self.tasks = [Task.from_dict(t) for t in task_list]
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"警告: 加载任务文件失败 - {e}")
                 self.tasks = []
