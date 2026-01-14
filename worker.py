@@ -42,6 +42,7 @@ class CleanupResult:
     success: bool = False
     handover_summary: Optional[str] = None  # 交接摘要内容
     cleanup_done: bool = False  # 是否输出了 CLEANUP_DONE
+    cost_usd: float = 0.0  # cleanup 阶段的 Claude 调用成本
 
 
 class WorkerProcess:
@@ -264,7 +265,7 @@ class WorkerProcess:
             return result
 
     def _parse_cleanup_log(self, cleanup_log_file: str) -> CleanupResult:
-        """解析清理日志，提取交接摘要"""
+        """解析清理日志，提取交接摘要和成本"""
         result = CleanupResult()
 
         if not os.path.exists(cleanup_log_file):
@@ -277,6 +278,19 @@ class WorkerProcess:
             # 检查是否有 CLEANUP_DONE 标记
             result.cleanup_done = "CLEANUP_DONE" in content
             result.success = result.cleanup_done
+
+            # 提取成本（从 stream-json 格式中）
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "result":
+                        result.cost_usd = event.get("total_cost_usd", 0.0)
+                        break
+                except json.JSONDecodeError:
+                    continue
 
             # 提取交接摘要（在 HANDOVER_START 和 HANDOVER_END 之间）
             # 从 stream-json 中提取文本内容

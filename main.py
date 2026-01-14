@@ -34,6 +34,7 @@ from worker import WorkerProcess
 from supervisor import Supervisor, Decision, SupervisorResult
 from validator import PostWorkValidator
 from orchestrator import TaskOrchestrator
+from cost_tracker import CostTracker, CostSource, estimate_cost_from_log
 
 
 class LongRunningAgent:
@@ -50,7 +51,7 @@ class LongRunningAgent:
         self.task_manager = TaskManager(self.tasks_file)
         self.supervisor = Supervisor(self.workspace_dir, verbose=verbose)
         self.orchestrator = TaskOrchestrator(self.workspace_dir, verbose=verbose)
-        self.total_cost = 0.0
+        self.cost_tracker = CostTracker(self.workspace_dir)
 
     def initialize(self):
         """初始化工作环境"""
@@ -418,10 +419,17 @@ class LongRunningAgent:
 
                     failed_task_retries += 1
                     print(f"\n🎭 检测到失败任务，调用 Orchestrator 处理 (尝试 {failed_task_retries}/{MAX_FAILED_RETRIES})...")
-                    self.orchestrator.orchestrate(
+                    orch_result = self.orchestrator.orchestrate(
                         trigger="检测到失败任务，立即处理",
                         context=self._get_failed_tasks_summary()
                     )
+                    # 记录 Orchestrator 成本
+                    if orch_result.cost_usd > 0:
+                        self.cost_tracker.add(
+                            source=CostSource.ORCHESTRATOR,
+                            cost_usd=orch_result.cost_usd,
+                            details="Handle failed tasks"
+                        )
                     # Orchestrator 处理后重新加载任务（可能已将 failed 改为 pending 或删除）
                     self.task_manager._load_tasks()
                     continue  # 重新检查是否还有失败任务
@@ -483,12 +491,22 @@ class LongRunningAgent:
                         while True:
                             sv_result, sv_check_count, sv_elapsed = supervisor_queue.get_nowait()
                             sv_elapsed_str = self._format_duration(sv_elapsed)
+                            # 记录 Supervisor 成本
+                            if sv_result.cost_usd > 0:
+                                self.cost_tracker.add(
+                                    source=CostSource.SUPERVISOR,
+                                    cost_usd=sv_result.cost_usd,
+                                    task_id=task.id,
+                                    details=f"Check #{sv_check_count}"
+                                )
                             # 显示 Supervisor 检查结果（不阻塞日志输出）
                             print(f"\n   {'─' * 40}")
                             print(f"   🔍 [{sv_elapsed_str}] Supervisor 检查 #{sv_check_count} 完成")
                             print(
                                 f"      📋 决策: \033[1m{sv_result.decision.value}\033[0m | {sv_result.reason}"
                             )
+                            if sv_result.cost_usd > 0:
+                                print(f"      💰 成本: ${sv_result.cost_usd:.4f}")
                             print(f"   {'─' * 40}\n")
 
                             if sv_result.decision != Decision.CONTINUE:
@@ -553,12 +571,40 @@ class LongRunningAgent:
                 worker_log = current_worker.read_log()
                 activity_summary = current_worker.get_log_summary(max_events=20)
 
+                # 尝试从日志提取成本（即使被中断也可能有 result 事件）
+                if worker_log.cost_usd > 0:
+                    self.cost_tracker.add(
+                        source=CostSource.WORKER,
+                        cost_usd=worker_log.cost_usd,
+                        task_id=task.id if task else None,
+                        details="Interrupted by Ctrl+C"
+                    )
+                else:
+                    # 尝试估算成本
+                    estimated_cost = estimate_cost_from_log(current_worker.log_file)
+                    if estimated_cost > 0:
+                        self.cost_tracker.add(
+                            source=CostSource.WORKER,
+                            cost_usd=estimated_cost,
+                            task_id=task.id if task else None,
+                            details="Estimated (interrupted)",
+                            estimated=True
+                        )
+
                 if current_worker.is_alive():
                     print(f"\n正在优雅终止 Worker...")
                     # 使用优雅关闭：先中断，然后让 Worker 执行清理工作
                     cleanup_result = current_worker.graceful_shutdown(
                         reason="用户按下 Ctrl+C 请求终止"
                     )
+                    # 记录 cleanup 成本
+                    if cleanup_result.cost_usd > 0:
+                        self.cost_tracker.add(
+                            source=CostSource.WORKER_CLEANUP,
+                            cost_usd=cleanup_result.cost_usd,
+                            task_id=task.id if task else None,
+                            details="Graceful shutdown cleanup"
+                        )
                     if cleanup_result.success:
                         print(f"   ✅ Worker 已优雅终止并完成清理")
                     else:
@@ -566,7 +612,7 @@ class LongRunningAgent:
                 else:
                     print(f"\n   ✅ Worker 已结束")
                     cleanup_result = type(
-                        "CleanupResult", (), {"success": True, "handover_summary": None}
+                        "CleanupResult", (), {"success": True, "handover_summary": None, "cost_usd": 0.0}
                     )()
 
                 # 记录中断信息到 task.notes（供下次 loop 使用）
@@ -594,6 +640,9 @@ class LongRunningAgent:
             elif cleanup_success:
                 print(f"\n   ✅ Worker 已保存工作状态，代码保留")
 
+            # 打印成本摘要
+            self.cost_tracker.print_summary()
+
             print("\n下次可以继续运行: python3 main.py run")
             return
 
@@ -602,7 +651,7 @@ class LongRunningAgent:
         print("📈 运行完成")
         print("=" * 60)
         self._print_stats()
-        print(f"\n💰 总成本: ${self.total_cost:.4f}")
+        self.cost_tracker.print_summary()
 
     def _handle_supervisor_decision(
         self, task: Task, worker: WorkerProcess, sv_result, commit_before: str
@@ -615,12 +664,40 @@ class LongRunningAgent:
         worker_log = worker.read_log()
         activity_summary = worker.get_log_summary(max_events=20)
 
+        # 记录 Worker 成本（即使被中断）
+        if worker_log.cost_usd > 0:
+            self.cost_tracker.add(
+                source=CostSource.WORKER,
+                cost_usd=worker_log.cost_usd,
+                task_id=task.id,
+                details="Interrupted by Supervisor"
+            )
+        else:
+            # 尝试估算成本
+            estimated_cost = estimate_cost_from_log(worker.log_file)
+            if estimated_cost > 0:
+                self.cost_tracker.add(
+                    source=CostSource.WORKER,
+                    cost_usd=estimated_cost,
+                    task_id=task.id,
+                    details="Estimated (supervisor interrupt)",
+                    estimated=True
+                )
+
         # 终止 Worker（使用优雅关闭）
         cleanup_result = None
         if worker.is_alive():
             cleanup_result = worker.graceful_shutdown(
                 reason=f"Supervisor 决策: {sv_result.reason}"
             )
+            # 记录 cleanup 成本
+            if cleanup_result.cost_usd > 0:
+                self.cost_tracker.add(
+                    source=CostSource.WORKER_CLEANUP,
+                    cost_usd=cleanup_result.cost_usd,
+                    task_id=task.id,
+                    details="Supervisor triggered cleanup"
+                )
 
         # 记录交接或活动摘要到 task.notes
         if cleanup_result and cleanup_result.handover_summary:
@@ -641,6 +718,14 @@ class LongRunningAgent:
                 trigger=f"Supervisor 决策: {sv_result.reason}",
                 context=f"任务 [{task.id}]: {task.description}"
             )
+            # 记录 Orchestrator 成本
+            if result.cost_usd > 0:
+                self.cost_tracker.add(
+                    source=CostSource.ORCHESTRATOR,
+                    cost_usd=result.cost_usd,
+                    task_id=task.id,
+                    details="Supervisor triggered orchestration"
+                )
             if result.success:
                 print(f"   ✅ 任务编排完成")
                 # 回退代码到任务开始前
@@ -658,8 +743,14 @@ class LongRunningAgent:
         log = worker.read_log()
 
         # 记录成本
-        self.total_cost += log.cost_usd
-        print(f"   💰 成本: ${log.cost_usd:.4f} | 总成本: ${self.total_cost:.4f}")
+        if log.cost_usd > 0:
+            self.cost_tracker.add(
+                source=CostSource.WORKER,
+                cost_usd=log.cost_usd,
+                task_id=task.id,
+                details=f"Task completed: {task.description[:30]}"
+            )
+        print(f"   💰 成本: ${log.cost_usd:.4f} | 总成本: ${self.cost_tracker.get_session_cost():.4f}")
 
         # 检查 Worker 是否报告了阻塞或错误
         if log.result and "TASK_BLOCKED" in log.result:
@@ -681,16 +772,33 @@ class LongRunningAgent:
         validator = PostWorkValidator(self.workspace_dir, self.task_manager)
         result = validator.validate_and_commit(task)
 
+        # 记录 Validator 成本
+        if result.cost_usd > 0:
+            self.cost_tracker.add(
+                source=CostSource.VALIDATOR,
+                cost_usd=result.cost_usd,
+                task_id=task.id,
+                details="Post-work validation"
+            )
+
         if result.success:
             print(f"   ✅ 任务完成!")
             self.task_manager.mark_completed(task.id)
         else:
             # 验证失败，调用 Orchestrator
             print(f"   🎭 验证未通过，调用 Orchestrator...")
-            self.orchestrator.orchestrate(
+            orch_result = self.orchestrator.orchestrate(
                 trigger=f"任务 [{task.id}] 验证失败",
                 context=f"任务描述: {task.description}\n错误: {'; '.join(result.errors)}"
             )
+            # 记录 Orchestrator 成本
+            if orch_result.cost_usd > 0:
+                self.cost_tracker.add(
+                    source=CostSource.ORCHESTRATOR,
+                    cost_usd=orch_result.cost_usd,
+                    task_id=task.id,
+                    details="Validation failed orchestration"
+                )
 
         # 清理 worker 日志（可选）
         # worker.cleanup()
@@ -815,6 +923,13 @@ class LongRunningAgent:
                     elif evt_type == "result":
                         full_result = event.get("result", "")
                         cost = event.get("total_cost_usd", 0)
+                        # 记录任务生成成本
+                        if cost > 0:
+                            self.cost_tracker.add(
+                                source=CostSource.TASK_GENERATION,
+                                cost_usd=cost,
+                                details="add_task_from_prompt"
+                            )
                         print(f"   " + "-" * 40)
                         print(f"   💰 成本: ${cost:.4f}")
 
@@ -987,6 +1102,13 @@ class LongRunningAgent:
                     elif evt_type == "result":
                         full_result = event.get("result", "")
                         cost = event.get("total_cost_usd", 0)
+                        # 记录任务创建成本
+                        if cost > 0:
+                            self.cost_tracker.add(
+                                source=CostSource.TASK_GENERATION,
+                                cost_usd=cost,
+                                details="create_tasks_from_prompt"
+                            )
                         print(f"\n   💰 成本: ${cost:.4f}")
 
                 except json_module.JSONDecodeError:

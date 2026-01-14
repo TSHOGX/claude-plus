@@ -30,6 +30,7 @@ class SupervisorResult:
 
     decision: Decision
     reason: str
+    cost_usd: float = 0.0  # Claude 调用成本
 
 
 # Supervisor 分析提示模板 - 只读分析
@@ -131,9 +132,12 @@ class Supervisor:
 
             output_data = json.loads(stdout)
             output_text = output_data.get("result", "")
+            cost_usd = output_data.get("total_cost_usd", 0.0)
 
             # 解析 JSON 响应
-            return self._parse_response(output_text)
+            result = self._parse_response(output_text)
+            result.cost_usd = cost_usd
+            return result
 
         except Exception as e:
             self._current_process = None

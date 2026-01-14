@@ -21,6 +21,7 @@ class ValidationResult:
     success: bool
     errors: List[str] = field(default_factory=list)
     commit_message: Optional[str] = None
+    cost_usd: float = 0.0  # Claude 调用成本
 
 
 class PostWorkValidator:
@@ -42,16 +43,16 @@ class PostWorkValidator:
         print(f"   📋 检测到 {len(changed_files)} 个变更文件")
 
         # 2. 调用 Claude 进行灵活验证并生成 commit 信息
-        commit_msg = self._generate_and_commit(task)
+        commit_msg, cost_usd = self._generate_and_commit(task)
         if commit_msg:
             # 清除 notes（任务成功完成）
             self.task_manager.clear_notes(task.id)
-            return ValidationResult(success=True, commit_message=commit_msg)
+            return ValidationResult(success=True, commit_message=commit_msg, cost_usd=cost_usd)
         else:
             # 验证失败
             error_msg = "验证未通过"
             self._update_task_notes(task, error_msg)
-            return ValidationResult(success=False, errors=[error_msg])
+            return ValidationResult(success=False, errors=[error_msg], cost_usd=cost_usd)
 
     def _get_changed_files(self) -> List[str]:
         """获取变更的文件列表"""
@@ -73,14 +74,19 @@ class PostWorkValidator:
                     files.append(parts[-1])
         return files
 
-    def _generate_and_commit(self, task) -> Optional[str]:
-        """使用 Claude 生成 commit 信息并提交"""
+    def _generate_and_commit(self, task) -> tuple:
+        """使用 Claude 生成 commit 信息并提交
+
+        Returns:
+            (commit_message, cost_usd) 元组
+        """
         # 构建提示 - 精简版，让 Claude 自己用 git diff
         prompt = POST_WORK_PROMPT.format(
             task_id=task.id,
             task_description=task.description,
         )
 
+        cost_usd = 0.0
         try:
             print("   💬 生成 commit 信息...")
             result = subprocess.run(
@@ -98,17 +104,18 @@ class PostWorkValidator:
 
             if result.returncode != 0:
                 print(f"   ⚠️  Claude 调用失败")
-                return self._fallback_commit(task)
+                return self._fallback_commit(task), 0.0
 
             output_data = json.loads(result.stdout)
             output_text = output_data.get("result", "")
+            cost_usd = output_data.get("total_cost_usd", 0.0)
 
             # 解析输出
             if "VALIDATION_FAILED" in output_text:
                 # Claude 认为验证失败
                 reason = output_text.split("VALIDATION_FAILED:")[-1].strip()[:100]
                 self._update_task_notes(task, f"验证失败: {reason}")
-                return None
+                return None, cost_usd
 
             if "COMMIT_MESSAGE_START" in output_text and "COMMIT_MESSAGE_END" in output_text:
                 start = output_text.find("COMMIT_MESSAGE_START") + len("COMMIT_MESSAGE_START")
@@ -119,11 +126,11 @@ class PostWorkValidator:
                 commit_msg = task.description
 
             # 执行 git commit
-            return self._do_commit(commit_msg)
+            return self._do_commit(commit_msg), cost_usd
 
         except Exception as e:
             print(f"   ⚠️  生成失败: {e}")
-            return self._fallback_commit(task)
+            return self._fallback_commit(task), cost_usd
 
     def _fallback_commit(self, task) -> Optional[str]:
         """使用默认格式生成 commit"""

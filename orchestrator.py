@@ -72,6 +72,7 @@ class OrchestratorResult:
     """编排结果"""
     success: bool
     message: str = ""
+    cost_usd: float = 0.0  # Claude 调用总成本
 
 
 class TaskOrchestrator:
@@ -94,6 +95,8 @@ class TaskOrchestrator:
         Returns:
             OrchestratorResult
         """
+        total_cost = 0.0
+
         if self.verbose:
             print(f"\n{'─' * 50}")
             print(f"🎭 TaskOrchestrator 启动")
@@ -112,17 +115,20 @@ class TaskOrchestrator:
             context=context if context else "无"
         )
 
-        orchestration_result = self._call_claude(prompt)
+        orchestration_result, cost = self._call_claude(prompt)
+        total_cost += cost
+
         if not orchestration_result or "ORCHESTRATION_DONE" not in orchestration_result:
             self._restore_backup(backup)
-            return OrchestratorResult(False, "编排未完成")
+            return OrchestratorResult(False, "编排未完成", total_cost)
 
         if self.verbose:
             print("   ✅ 编排完成，开始审视...")
 
         # 3. 审视修改（最多尝试 max_review_attempts 次）
         for attempt in range(self.max_review_attempts):
-            review_result = self._call_claude(ORCHESTRATOR_REVIEW_PROMPT)
+            review_result, cost = self._call_claude(ORCHESTRATOR_REVIEW_PROMPT)
+            total_cost += cost
 
             if review_result and "REVIEW_PASSED" in review_result:
                 if self.verbose:
@@ -136,23 +142,23 @@ class TaskOrchestrator:
             if self.verbose:
                 print(f"   ❌ 审视失败，回退更改")
             self._restore_backup(backup)
-            return OrchestratorResult(False, "审视多次失败")
+            return OrchestratorResult(False, "审视多次失败", total_cost)
 
         # 4. 校验 JSON 格式
         if not self._validate_tasks():
             if self.verbose:
                 print("   ❌ JSON 校验失败，回退")
             self._restore_backup(backup)
-            return OrchestratorResult(False, "JSON 格式无效")
+            return OrchestratorResult(False, "JSON 格式无效", total_cost)
 
         # 5. Git commit（只提交 tasks.json）
         commit_success = self._commit_tasks(trigger)
         if commit_success:
             if self.verbose:
                 print("   ✅ 已提交任务调整")
-            return OrchestratorResult(True, "任务编排完成")
+            return OrchestratorResult(True, "任务编排完成", total_cost)
         else:
-            return OrchestratorResult(True, "任务已调整（无需提交）")
+            return OrchestratorResult(True, "任务已调整（无需提交）", total_cost)
 
     def _backup_tasks(self) -> Optional[str]:
         """备份 tasks.json 内容"""
@@ -174,8 +180,13 @@ class TaskOrchestrator:
             capture_output=True
         )
 
-    def _call_claude(self, prompt: str) -> Optional[str]:
-        """调用 Claude Code（流式输出，无超时）"""
+    def _call_claude(self, prompt: str) -> tuple:
+        """调用 Claude Code（流式输出，无超时）
+
+        Returns:
+            (result, cost_usd) 元组
+        """
+        cost = 0.0
         try:
             process = subprocess.Popen(
                 [
@@ -232,14 +243,14 @@ class TaskOrchestrator:
                 stderr = process.stderr.read()
                 if self.verbose:
                     print(f"   ⚠️  Claude 调用失败: {stderr[:100]}")
-                return None
+                return None, cost
 
-            return full_result
+            return full_result, cost
 
         except Exception as e:
             if self.verbose:
                 print(f"   ⚠️  Claude 调用异常: {e}")
-            return None
+            return None, cost
 
     def _validate_tasks(self) -> bool:
         """校验 tasks.json 格式"""
