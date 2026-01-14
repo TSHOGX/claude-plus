@@ -36,7 +36,7 @@ def is_safe_workspace(path: str) -> tuple[bool, str]:
 CLAUDE_CMD = "claude"
 
 # Supervisor 配置
-CHECK_INTERVAL = 600  # Supervisor 检查间隔（秒），默认 10 分钟
+CHECK_INTERVAL = 1500  # Supervisor 检查间隔（秒），默认 25 分钟
 # MAX_TASK_DURATION 已移除 - 改为由 Supervisor 智能判断，不设硬性上限
 
 

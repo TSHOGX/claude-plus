@@ -533,6 +533,9 @@ class LongRunningAgent:
 
                 # Worker 自然结束
                 if not decision_made:
+                    # 取消正在进行的 Supervisor 分析（Worker 已完成，不需要继续检查）
+                    if supervisor_thread and supervisor_thread.is_alive():
+                        self.supervisor.cancel()
                     self._finalize_worker(task, worker, commit_before_task)
 
                 current_worker = None

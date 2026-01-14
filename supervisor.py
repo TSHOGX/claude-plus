@@ -32,8 +32,15 @@ class SupervisorResult:
     reason: str
 
 
-# Supervisor 分析提示模板 - 精简版
+# Supervisor 分析提示模板 - 只读分析
 SUPERVISOR_PROMPT = """你是 Agent 执行监督者。
+
+## 重要约束
+**禁止执行任何修改操作！** 你只能读取和分析，不能：
+- 修改任何文件
+- 执行任何命令
+- 创建或删除文件
+你的唯一任务是分析日志并输出 JSON 决策。
 
 ## 任务信息
 - 描述: {task_description}
@@ -41,14 +48,16 @@ SUPERVISOR_PROMPT = """你是 Agent 执行监督者。
 - 日志文件: {log_file}
 
 ## 你的任务
-1. 阅读日志文件了解 Worker 执行情况
+1. 使用 Read 工具阅读日志文件了解 Worker 执行情况
 2. 判断是否需要干预
+3. 输出 JSON 决策（不要做其他事情）
 
 ## 决策选项
 - continue: Worker 在正常工作（有新进展、正在调试等）
 - orchestrate: 需要重新审视任务（陷入循环、任务太大、发现新问题、需要人工等）
 
-## 输出 JSON
+## 输出格式
+只输出一个 JSON，不要有其他内容：
 {{"decision": "continue|orchestrate", "reason": "简要原因"}}
 """
 
@@ -59,11 +68,27 @@ class Supervisor:
     def __init__(self, workspace_dir: str, verbose: bool = True):
         self.workspace_dir = workspace_dir
         self.verbose = verbose
+        self._current_process: subprocess.Popen = None
+        self._cancelled = False
+
+    def cancel(self):
+        """取消正在进行的分析"""
+        self._cancelled = True
+        if self._current_process and self._current_process.poll() is None:
+            if self.verbose:
+                print(f"   🛑 Supervisor 分析已取消")
+            self._current_process.terminate()
+            try:
+                self._current_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._current_process.kill()
 
     def analyze(
         self, task: Task, worker: WorkerProcess, check_count: int = 0, elapsed: float = 0
     ) -> SupervisorResult:
         """分析 Worker 执行情况并做出决策"""
+        self._cancelled = False
+
         # 格式化运行时长
         hours = int(elapsed // 3600)
         minutes = int((elapsed % 3600) // 60)
@@ -80,9 +105,9 @@ class Supervisor:
         if self.verbose:
             print(f"   🔍 Supervisor 分析中...")
 
-        # 调用 Claude 分析
+        # 调用 Claude 分析（不设超时，支持取消）
         try:
-            result = subprocess.run(
+            self._current_process = subprocess.Popen(
                 [
                     CLAUDE_CMD,
                     "-p",
@@ -91,25 +116,29 @@ class Supervisor:
                     "--dangerously-skip-permissions",
                     prompt,
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=60,
                 cwd=self.workspace_dir,
             )
 
-            output_data = json.loads(result.stdout)
+            stdout, _ = self._current_process.communicate()
+            self._current_process = None
+
+            # 检查是否被取消
+            if self._cancelled:
+                return SupervisorResult(decision=Decision.CONTINUE, reason="分析被取消")
+
+            output_data = json.loads(stdout)
             output_text = output_data.get("result", "")
 
             # 解析 JSON 响应
             return self._parse_response(output_text)
 
-        except subprocess.TimeoutExpired:
-            if self.verbose:
-                print(f"   ⚠️  Supervisor 分析超时")
-            return SupervisorResult(
-                decision=Decision.CONTINUE, reason="分析超时，继续等待"
-            )
         except Exception as e:
+            self._current_process = None
+            if self._cancelled:
+                return SupervisorResult(decision=Decision.CONTINUE, reason="分析被取消")
             if self.verbose:
                 print(f"   ⚠️  Supervisor 分析失败: {e}")
             return SupervisorResult(decision=Decision.CONTINUE, reason=f"分析失败: {e}")
