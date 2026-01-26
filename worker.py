@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 from task_manager import Task
-from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, GRACEFUL_SHUTDOWN_TIMEOUT
+from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, GRACEFUL_SHUTDOWN_TIMEOUT, TASK_PROMPT_TEMPLATE
 
 
 @dataclass
@@ -41,7 +41,7 @@ class CleanupResult:
 
     success: bool = False
     handover_summary: Optional[str] = None  # 交接摘要内容
-    cleanup_done: bool = False  # 是否输出了 CLEANUP_DONE
+    cleanup_done: bool = False  # 是否输出了 HANDOVER_END
     cost_usd: float = 0.0  # cleanup 阶段的 Claude 调用成本
 
 
@@ -74,16 +74,12 @@ class WorkerProcess:
 
     def _build_task_prompt(self) -> str:
         """构建任务提示"""
-        return f"""请执行以下任务：
-
-## 任务 ID: {self.task.id}
-## 描述: {self.task.description}
-
-## 步骤:
-{chr(10).join(f"- {step}" for step in self.task.steps)}
-
-请开始执行，完成后输出 TASK_COMPLETED，遇到问题输出 TASK_BLOCKED: <原因>。
-"""
+        steps_text = "\n".join(f"- {step}" for step in self.task.steps)
+        return TASK_PROMPT_TEMPLATE.format(
+            task_id=self.task.id,
+            task_description=self.task.description,
+            task_steps=steps_text if steps_text else "- 无具体步骤，请自行规划",
+        )
 
     def start(self) -> int:
         """启动 Worker 进程，返回 PID"""
@@ -255,7 +251,7 @@ class WorkerProcess:
                 if result.handover_summary:
                     print(f"      📋 已提取交接摘要")
             else:
-                print(f"      ⚠️  清理完成（未检测到 CLEANUP_DONE 标记）")
+                print(f"      ⚠️  清理完成（未检测到 HANDOVER_END 标记）")
                 result.success = True  # 即使没有标记也算成功
 
             return result
@@ -275,8 +271,8 @@ class WorkerProcess:
             with open(cleanup_log_file, "r") as f:
                 content = f.read()
 
-            # 检查是否有 CLEANUP_DONE 标记
-            result.cleanup_done = "CLEANUP_DONE" in content
+            # 检查是否有 HANDOVER_END 标记（表示清理完成）
+            result.cleanup_done = "HANDOVER_END" in content
             result.success = result.cleanup_done
 
             # 提取成本（从 stream-json 格式中）

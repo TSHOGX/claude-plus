@@ -16,7 +16,6 @@ class Task:
     id: str
     description: str
     priority: int = 1
-    category: str = "feature"
     steps: List[str] = field(default_factory=list)
     status: str = TaskStatus.PENDING
     session_id: Optional[str] = None
@@ -164,78 +163,3 @@ class TaskManager:
     def get_all_tasks(self) -> List[Task]:
         """获取所有任务"""
         return self.tasks.copy()
-
-
-def create_example_tasks() -> List[Task]:
-    """创建示例任务（TODO 应用）"""
-    return [
-        Task(
-            id="001",
-            description="创建 Todo 数据模型",
-            priority=1,
-            category="core",
-            steps=[
-                "在 workspace 目录创建 todo_app 子目录",
-                "创建 models.py 文件",
-                "定义 Todo 类，包含 id, title, completed, created_at 字段",
-                "添加 to_dict 和 from_dict 方法",
-            ],
-        ),
-        Task(
-            id="002",
-            description="实现添加任务功能",
-            priority=2,
-            category="feature",
-            steps=[
-                "在 todo_app 目录创建 todo_manager.py",
-                "实现 TodoManager 类",
-                "实现 add_todo(title) 方法",
-                "使用 JSON 文件存储数据",
-            ],
-        ),
-        Task(
-            id="003",
-            description="实现列出任务功能",
-            priority=3,
-            category="feature",
-            steps=[
-                "在 TodoManager 中添加 list_todos() 方法",
-                "支持过滤：全部、已完成、未完成",
-                "按创建时间排序",
-            ],
-        ),
-        Task(
-            id="004",
-            description="实现完成任务功能",
-            priority=4,
-            category="feature",
-            steps=[
-                "在 TodoManager 中添加 complete_todo(id) 方法",
-                "更新 todo 的 completed 状态",
-                "保存更新到文件",
-            ],
-        ),
-        Task(
-            id="005",
-            description="实现删除任务功能",
-            priority=5,
-            category="feature",
-            steps=[
-                "在 TodoManager 中添加 delete_todo(id) 方法",
-                "从列表中移除指定 todo",
-                "保存更新到文件",
-            ],
-        ),
-        Task(
-            id="006",
-            description="添加 CLI 交互界面",
-            priority=6,
-            category="feature",
-            steps=[
-                "创建 cli.py 文件",
-                "使用 argparse 或简单的命令循环",
-                "支持命令: add, list, complete, delete, quit",
-                "美化输出格式",
-            ],
-        ),
-    ]

@@ -18,7 +18,6 @@
     "id": "001",                          // 必填：唯一标识符
     "description": "实现用户登录功能",      // 必填：一句话描述任务目标
     "priority": 1,                         // 必填：执行优先级（数字越小越优先）
-    "category": "feature",                 // 可选：分类（core/feature/bugfix/refactor）
     "steps": [                             // 必填：具体执行步骤
       "创建 auth.py 文件",
       "实现 login(username, password) 函数",
@@ -56,19 +55,19 @@
 
 ```json
 [
-  {"id": "001", "priority": 1, "category": "core",
+  {"id": "001", "priority": 1,
     "description": "创建 Post 数据模型",
     "steps": ["创建 models/post.py", "定义 Post 类", "添加序列化方法"]},
 
-  {"id": "002", "priority": 2, "category": "feature",
+  {"id": "002", "priority": 2,
     "description": "实现文章存储功能",
     "steps": ["创建 PostManager 类", "实现 save_post()", "JSON 持久化"]},
 
-  {"id": "003", "priority": 3, "category": "feature",
+  {"id": "003", "priority": 3,
     "description": "实现文章列表功能",
     "steps": ["添加 list_posts()", "支持分页", "按时间倒序"]},
 
-  {"id": "004", "priority": 4, "category": "feature",
+  {"id": "004", "priority": 4,
     "description": "实现文章搜索功能",
     "steps": ["添加 search_posts(keyword)", "搜索标题和内容"]}
 ]

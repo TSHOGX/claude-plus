@@ -13,58 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from config import CLAUDE_CMD
-
-
-# 编排提示模板
-ORCHESTRATOR_PROMPT = """你是任务编排者。需要重新审视和调整任务列表。
-
-## 触发原因
-{trigger_reason}
-
-## 额外上下文
-{context}
-
-## 你的任务
-1. 阅读 CLAUDE.md 了解项目目标
-2. 阅读 tasks.json 了解当前任务列表
-3. 运行 git log --oneline -10 了解最近进展
-4. 根据触发原因，对 tasks.json 进行必要的调整：
-   - 可以增加新任务（新发现的问题等）
-   - 可以修改现有任务的描述/步骤/优先级
-   - 可以删除不再需要的 pending 任务
-5. 直接编辑 tasks.json 文件
-
-## 处理失败任务 (status=failed)
-对于失败的任务，你必须采取以下其一：
-1. **重试**: 将 status 改为 "pending"，清除 error_message（如果是临时性问题）
-2. **修改后重试**: 修改任务的 description/steps 后，将 status 改为 "pending"
-3. **拆分**: 将复杂任务拆分为多个小任务，删除原任务
-4. **删除**: 如果任务不再需要，直接删除
-
-重要：不能让 failed 任务保持 failed 状态，必须处理！
-
-## 约束
-- 任务粒度适中（单任务 10-15 分钟内可完成）
-- 保持 id 唯一
-- 不要修改 status=completed 的任务
-- 不要删除 status=in_progress 的任务
-
-完成后输出 ORCHESTRATION_DONE
-"""
-
-ORCHESTRATOR_REVIEW_PROMPT = """请审视你刚才对任务列表的修改。
-
-1. 运行 git diff tasks.json 查看改动
-2. 检查：
-   - JSON 格式是否正确
-   - ID 是否唯一
-   - 是否意外删除了进行中的任务
-   - 修改是否符合项目目标
-
-如果发现问题，请修复。
-如果没有问题，输出 REVIEW_PASSED
-"""
+from config import CLAUDE_CMD, ORCHESTRATOR_PROMPT, ORCHESTRATOR_REVIEW_PROMPT
 
 
 @dataclass

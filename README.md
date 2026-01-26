@@ -262,7 +262,7 @@ python3 main.py run
 编辑 `config.py`：
 
 ```python
-CHECK_INTERVAL = 1500  # Supervisor 检查间隔（秒），默认 25 分钟
+CHECK_INTERVAL = 1800  # Supervisor 检查间隔（秒），默认 30 分钟
 ```
 
 > Supervisor 会智能判断任务执行状态，不设硬性超时上限。

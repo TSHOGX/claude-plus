@@ -14,7 +14,7 @@ from typing import Optional, List
 from enum import Enum
 from task_manager import Task
 from worker import WorkerProcess
-from config import CLAUDE_CMD
+from config import CLAUDE_CMD, SUPERVISOR_PROMPT
 
 
 class Decision(Enum):
@@ -31,36 +31,6 @@ class SupervisorResult:
     decision: Decision
     reason: str
     cost_usd: float = 0.0  # Claude 调用成本
-
-
-# Supervisor 分析提示模板 - 只读分析
-SUPERVISOR_PROMPT = """你是 Agent 执行监督者。
-
-## 重要约束
-**禁止执行任何修改操作！** 你只能读取和分析，不能：
-- 修改任何文件
-- 执行任何命令
-- 创建或删除文件
-你的唯一任务是分析日志并输出 JSON 决策。
-
-## 任务信息
-- 描述: {task_description}
-- 已运行: {elapsed_time}
-- 日志文件: {log_file}
-
-## 你的任务
-1. 使用 Read 工具阅读日志文件了解 Worker 执行情况
-2. 判断是否需要干预
-3. 输出 JSON 决策（不要做其他事情）
-
-## 决策选项
-- continue: Worker 在正常工作（有新进展、正在调试等）
-- orchestrate: 需要重新审视任务（陷入循环、任务太大、发现新问题、需要人工等）
-
-## 输出格式
-只输出一个 JSON，不要有其他内容：
-{{"decision": "continue|orchestrate", "reason": "简要原因"}}
-"""
 
 
 class Supervisor:
