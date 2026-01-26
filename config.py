@@ -184,20 +184,12 @@ TASKS_CREATION_PROMPT = """你是任务规划师。根据用户需求，为项�
 # Post-work 验证提示模板 - 自主验证和提交
 POST_WORK_PROMPT = """任务: {task_description} 已执行完毕，请验证并提交改动。
 
-## 你的职责
-1. 验证代码改动是否正确
-2. 验证通过后执行 git commit
-3. 不需要提交的文件（日志、缓存等）加入 .gitignore
-
-## 验证建议（根据实际情况选择）
-- 查看 git diff 了解改动范围
-- 语法/类型检查（如项目有配置）
-- 运行测试（如项目有测试）
-- 简单功能验证（如适用）
-
-## Commit 格式建议
-- 遵循项目现有的 commit 风格
-- 若无现有风格，建议使用 conventional commits（如 feat:, fix:, refactor:）
+## 建议步骤
+1. **Review** - git diff 审查改动，确保一致性（无遗漏的关联修改）
+2. **Clean** - 清理调试代码、无用注释、dead code，运行 linter（如有）
+3. **Test** - 运行测试或功能验证
+4. **Update Docs** - 同步更新受影响功能的文档
+5. **Commit** - 提交改动，遵循项目 commit 风格
 
 ## 完成标准
 确保 git status 干净（无未提交的改动）
