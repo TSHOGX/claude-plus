@@ -1037,7 +1037,7 @@ class LongRunningAgent:
         except Exception:
             pass
 
-    def _call_claude_for_creation(self, prompt: str, timeout: int = 180):
+    def _call_claude_for_creation(self, prompt: str):
         """调用 Claude Code 生成任务（流式输出）"""
         import json as json_module
         try:
@@ -1090,7 +1090,7 @@ class LongRunningAgent:
                 except json_module.JSONDecodeError:
                     continue
 
-            process.wait(timeout=timeout)
+            process.wait()
             return full_result
 
         except Exception as e:

@@ -49,9 +49,6 @@ class TaskStatus:
 # Worker 系统提示模板（追加到系统提示）
 SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务，开始前建议运行 git log --oneline -5 了解最近进展。"""
 
-# 优雅退出配置
-GRACEFUL_SHUTDOWN_TIMEOUT = 600  # 清理会话最大时长（秒），默认 10 分钟
-
 # 清理会话提示模板
 CLEANUP_PROMPT_TEMPLATE = """⚠️ 紧急通知：任务需要终止，请立即执行清理工作。
 

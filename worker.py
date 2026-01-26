@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 from task_manager import Task
-from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, GRACEFUL_SHUTDOWN_TIMEOUT, TASK_PROMPT_TEMPLATE
+from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE
 
 
 @dataclass
@@ -231,17 +231,8 @@ class WorkerProcess:
                     start_new_session=True,
                 )
 
-            # 等待清理完成（有超时）
-            start = time.time()
-            while cleanup_proc.poll() is None:
-                if time.time() - start > GRACEFUL_SHUTDOWN_TIMEOUT:
-                    print(f"      ⚠️  清理超时，强制终止")
-                    try:
-                        os.killpg(os.getpgid(cleanup_proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        pass
-                    return result
-                time.sleep(1)
+            # 等待清理完成
+            cleanup_proc.wait()
 
             # 5. 解析清理日志，提取交接摘要
             result = self._parse_cleanup_log(cleanup_log_file)
