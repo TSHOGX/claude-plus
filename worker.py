@@ -64,21 +64,21 @@ class WorkerProcess:
 
     def _build_system_prompt(self) -> str:
         """构建系统提示"""
-        steps_text = "\n".join(
-            f"  {i+1}. {step}" for i, step in enumerate(self.task.steps)
-        )
-        return SYSTEM_PROMPT_TEMPLATE.format(
-            task_description=self.task.description,
-            task_steps=steps_text if steps_text else "无具体步骤，请自行规划",
-        )
+        return SYSTEM_PROMPT_TEMPLATE
 
     def _build_task_prompt(self) -> str:
         """构建任务提示"""
         steps_text = "\n".join(f"- {step}" for step in self.task.steps)
+
+        # 如果有 notes，添加上下文信息
+        notes_section = ""
+        if self.task.notes:
+            notes_section = f"\n## 上次执行记录\n{self.task.notes}\n"
+
         return TASK_PROMPT_TEMPLATE.format(
-            task_id=self.task.id,
             task_description=self.task.description,
             task_steps=steps_text if steps_text else "- 无具体步骤，请自行规划",
+            notes_section=notes_section,
         )
 
     def start(self) -> int:

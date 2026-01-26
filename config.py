@@ -46,32 +46,8 @@ class TaskStatus:
     FAILED = "failed"
 
 
-# 完成标记（Claude 应该在输出中包含这些标记）
-COMPLETION_MARKERS = {
-    "success": "TASK_COMPLETED",
-    "blocked": "TASK_BLOCKED:",
-    "error": "TASK_ERROR:",
-}
-
-# Worker 系统提示模板
-SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务。
-
-## 当前任务
-{task_description}
-
-## 任务步骤
-{task_steps}
-
-## 开始前
-1. 运行 git log --oneline -5 了解最近进展
-2. 如果当前任务需要接续上次工作，查阅 tasks.json 中的 notes 字段
-
-## 重要规则
-1. 只专注于当前任务，不要尝试完成其他任务
-2. 完成后输出 TASK_COMPLETED
-3. 遇到阻塞输出 TASK_BLOCKED: <原因>
-4. 遇到错误输出 TASK_ERROR: <错误描述>
-"""
+# Worker 系统提示模板（追加到系统提示）
+SYSTEM_PROMPT_TEMPLATE = """你正在执行一个增量开发任务，开始前建议运行 git log --oneline -5 了解最近进展。"""
 
 # 优雅退出配置
 GRACEFUL_SHUTDOWN_TIMEOUT = 600  # 清理会话最大时长（秒），默认 10 分钟
@@ -233,15 +209,13 @@ POST_WORK_PROMPT = """任务 [{task_id}]: {task_description} 已执行完毕，�
 """
 
 # Worker 任务提示模板
-TASK_PROMPT_TEMPLATE = """请执行以下任务：
+TASK_PROMPT_TEMPLATE = """## 任务
+{task_description}
 
-## 任务 ID: {task_id}
-## 描述: {task_description}
-
-## 步骤:
+## 参考步骤
 {task_steps}
-
-请开始执行，完成后输出 TASK_COMPLETED，遇到问题输出 TASK_BLOCKED: <原因>。
+{notes_section}
+请开始执行。
 """
 
 # Supervisor 分析提示模板 - 只读分析
@@ -285,27 +259,36 @@ ORCHESTRATOR_PROMPT = """你是任务编排者。需要重新审视和调整任�
 ## 你的任务
 1. 阅读 CLAUDE.md 了解项目目标
 2. 阅读 tasks.json 了解当前任务列表
-3. 运行 git log --oneline -10 了解最近进展
-4. 根据触发原因，对 tasks.json 进行必要的调整：
-   - 可以增加新任务（新发现的问题等）
-   - 可以修改现有任务的描述/步骤/优先级
-   - 可以删除不再需要的 pending 任务
+3. 运行 git log --oneline -10 和 git diff 了解最近进展和代码状态
+4. 从全局角度审视并优化任务列表
 5. 直接编辑 tasks.json 文件
 
-## 处理失败任务 (status=failed)
-对于失败的任务，你必须采取以下其一：
-1. **重试**: 将 status 改为 "pending"，清除 error_message（如果是临时性问题）
-2. **修改后重试**: 修改任务的 description/steps 后，将 status 改为 "pending"
-3. **拆分**: 将复杂任务拆分为多个小任务，删除原任务
-4. **删除**: 如果任务不再需要，直接删除
+## 编排原则
 
-重要：不能让 failed 任务保持 failed 状态，必须处理！
+站在项目全局的角度思考，对 pending、in_progress、failed 任务一视同仁地进行调整：
 
-## 约束
-- 任务粒度适中（单任务 10-15 分钟内可完成）
-- 保持 id 唯一
-- 不要修改 status=completed 的任务
-- 不要删除 status=in_progress 的任务
+- **增加**: 发现新的必要任务
+- **删除**: 移除不再需要的任务
+- **修改**: 调整 description/steps/priority 使其更清晰、更可执行
+- **拆分**: 将大任务拆分为多个小任务（10-15分钟可完成）
+- **合并**: 将过于细碎的任务合并
+- **重排**: 调整优先级以优化执行顺序
+
+## 充分利用 notes 字段
+
+notes 用于在任务间传递上下文，帮助后续 Worker 更高效地工作：
+- 已完成的进展
+- 遇到的问题和尝试过的方案
+- 易错点和注意事项
+- 建议的执行方式
+
+## 处理要点
+
+- 如果任务部分完成，可以创建新任务记录已完成的工作（status: completed），然后更新原任务只包含剩余工作
+- 如果代码改动有问题，可以用 git checkout/reset 回退
+- failed 任务必须处理（重试/修改/拆分/删除），不能保持 failed 状态
+- completed 任务不要修改
+- 保持 id 唯一，新任务建议用原 id 加后缀如 "003a"
 
 完成后输出 ORCHESTRATION_DONE
 """
@@ -317,11 +300,10 @@ ORCHESTRATOR_REVIEW_PROMPT = """请审视你刚才对任务列表的修改。
 2. 检查：
    - JSON 格式是否正确
    - ID 是否唯一
-   - 是否意外删除了进行中的任务
-   - 修改是否符合项目目标
+   - 任务粒度是否合适（10-15分钟可完成）
+   - notes 是否包含有用的上下文信息
+   - 没有遗留 failed 状态的任务
 
 如果发现问题，请修复。
 如果没有问题，输出 REVIEW_PASSED
 """
-
-

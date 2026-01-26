@@ -31,7 +31,8 @@ class TaskOrchestrator:
         self.workspace_dir = workspace_dir
         self.tasks_file = os.path.join(workspace_dir, "tasks.json")
         self.verbose = verbose
-        self.max_review_attempts = 3
+        self.max_orchestration_attempts = 3  # 编排重试次数
+        self.max_review_attempts = 3          # 审视重试次数
 
     def orchestrate(self, trigger: str, context: str = "") -> OrchestratorResult:
         """
@@ -52,24 +53,42 @@ class TaskOrchestrator:
             print(f"   触发原因: {trigger}")
             print(f"{'─' * 50}")
 
-        # 1. 备份当前 tasks.json（用于回退）
+        # 1. 备份当前 tasks.json（只在开始时备份一次，防止重试时覆盖）
         backup = self._backup_tasks()
 
-        # 2. 调用 Claude Code 进行编排
-        if self.verbose:
-            print("   📝 调用 Claude Code 编排任务...")
+        # 2. 调用 Claude Code 进行编排（带重试）
+        orchestration_result = None
+        last_failure_reason = None
 
-        prompt = ORCHESTRATOR_PROMPT.format(
-            trigger_reason=trigger,
-            context=context if context else "无"
-        )
+        for attempt in range(self.max_orchestration_attempts):
+            if self.verbose:
+                if attempt == 0:
+                    print("   📝 调用 Claude Code 编排任务...")
+                else:
+                    print(f"   ⚠️  重试编排 ({attempt + 1}/{self.max_orchestration_attempts})...")
 
-        orchestration_result, cost = self._call_claude(prompt)
-        total_cost += cost
+            # 构建 prompt，如果有上次失败原因则追加
+            prompt = ORCHESTRATOR_PROMPT.format(
+                trigger_reason=trigger,
+                context=context if context else "无"
+            )
+            if last_failure_reason:
+                prompt += f"\n\n⚠️ 上次编排未完成：{last_failure_reason}\n请确保完成后输出 ORCHESTRATION_DONE"
 
-        if not orchestration_result or "ORCHESTRATION_DONE" not in orchestration_result:
+            result, cost = self._call_claude(prompt)
+            total_cost += cost
+
+            if result and "ORCHESTRATION_DONE" in result:
+                orchestration_result = result
+                break
+            else:
+                last_failure_reason = "输出中未包含 ORCHESTRATION_DONE 标记"
+                if self.verbose:
+                    print(f"   ⚠️  编排未完成：{last_failure_reason}")
+
+        if not orchestration_result:
             self._restore_backup(backup)
-            return OrchestratorResult(False, "编排未完成", total_cost)
+            return OrchestratorResult(False, f"编排 {self.max_orchestration_attempts} 次均未完成", total_cost)
 
         if self.verbose:
             print("   ✅ 编排完成，开始审视...")
@@ -254,7 +273,7 @@ class TaskOrchestrator:
             capture_output=True
         )
 
-        commit_msg = f"TaskOrchestrator: {trigger[:50]}"
+        commit_msg = f"TaskOrchestrator: {trigger}"
         result = subprocess.run(
             ["git", "commit", "-m", commit_msg],
             cwd=self.workspace_dir,

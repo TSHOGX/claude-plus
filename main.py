@@ -12,15 +12,12 @@
 
 import os
 import sys
-import signal
 import argparse
 import subprocess
 import threading
 from queue import Queue, Empty
-from datetime import datetime
 
 from config import (
-    DEFAULT_WORKSPACE_DIR,
     CHECK_INTERVAL,
     get_paths,
     is_safe_workspace,
@@ -29,7 +26,6 @@ from config import (
     TASKS_CREATION_PROMPT,
 )
 from task_manager import TaskManager, Task
-# progress_log 已弃用，进度通过 git commit 和 task.notes 追踪
 from worker import WorkerProcess
 from supervisor import Supervisor, Decision, SupervisorResult
 from validator import PostWorkValidator
@@ -728,9 +724,6 @@ class LongRunningAgent:
                 )
             if result.success:
                 print(f"   ✅ 任务编排完成")
-                # 回退代码到任务开始前
-                if commit_before and self._git_reset_to(commit_before):
-                    print(f"   ✅ 已回退代码到: {commit_before[:8]}")
             else:
                 print(f"   ⚠️  编排失败: {result.message}")
                 self.task_manager.mark_failed(task.id, f"编排失败: {result.message}")
@@ -752,14 +745,7 @@ class LongRunningAgent:
             )
         print(f"   💰 成本: ${log.cost_usd:.4f} | 总成本: ${self.cost_tracker.get_session_cost():.4f}")
 
-        # 检查 Worker 是否报告了阻塞或错误
-        if log.result and "TASK_BLOCKED" in log.result:
-            error = log.result.split("TASK_BLOCKED:")[-1].strip()[:100]
-            print(f"   ⏸️  任务被阻塞: {error}")
-            self.task_manager.update_notes(task.id, f"阻塞: {error}")
-            self.task_manager.mark_failed(task.id, error)
-            return
-
+        # 检查 Claude CLI 是否返回错误（异常情况）
         if log.is_error:
             error_msg = log.result[:200] if log.result else "执行失败"
             print(f"   ❌ Worker 执行失败: {error_msg[:50]}...")
