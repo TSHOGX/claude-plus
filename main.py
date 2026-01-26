@@ -2,7 +2,6 @@
 """
 长时间运行代理系统 - 主编排器
 
-基于 Anthropic 博客 "Effective Harnesses for Long-Running Agents" 的思路实现。
 核心思想：
 1. 每个会话只处理一个任务
 2. 使用 JSON 文件管理任务状态
@@ -24,6 +23,7 @@ from config import (
     CLAUDE_CMD,
     TASK_GENERATION_PROMPT,
     TASKS_CREATION_PROMPT,
+    TASKS_FIX_PROMPT,
 )
 from task_manager import TaskManager, Task
 from worker import WorkerProcess
@@ -87,9 +87,18 @@ class LongRunningAgent:
                 """
 [
   {
-    "id": "001",
-    "description": "任务描述",
-    "priority": 1,
+    "id": "1",
+    "description": "第一个任务",
+    "steps": ["步骤1", "步骤2"]
+  },
+  {
+    "id": "1.1",
+    "description": "子任务",
+    "steps": ["步骤1", "步骤2"]
+  },
+  {
+    "id": "2",
+    "description": "第二个顶层任务",
     "steps": ["步骤1", "步骤2"]
   }
 ]
@@ -180,25 +189,6 @@ class LongRunningAgent:
         print(f"  已完成: {stats['completed']}")
         print(f"  失败: {stats['failed']}")
 
-    def _get_worker_activity(self, worker: WorkerProcess) -> str:
-        """获取 Worker 最近活动摘要"""
-        log = worker.read_log()
-        if not log.events:
-            return ""
-
-        # 获取最近的事件
-        recent = log.events[-3:]
-        activities = []
-        for evt in recent:
-            if evt["type"] == "tool":
-                name = evt["name"]
-                inp = evt.get("input", "")[:25]
-                activities.append(f"{name}({inp})")
-            elif evt["type"] == "text":
-                activities.append(evt["content"][:35] + "...")
-
-        return " → ".join(activities) if activities else ""
-
     def _format_duration(self, seconds: float) -> str:
         """格式化时长为 HH:MM:SS"""
         hours = int(seconds // 3600)
@@ -246,7 +236,7 @@ class LongRunningAgent:
                 print(f"   {line}")
         print("=" * 60 + "\n")
 
-    def _generate_activity_summary(self, worker_log, activity_summary: str) -> str:
+    def _generate_activity_summary(self, worker_log) -> str:
         """从日志中生成活动摘要（当没有交接摘要时使用）"""
         lines = ["## 执行情况（自动生成）"]
         lines.append("Worker 在中断前未能完成交接摘要，以下是从日志中提取的活动记录：")
@@ -445,7 +435,6 @@ class LongRunningAgent:
                 # 显示任务信息
                 print(f"\n{'─' * 50}")
                 print(f"📝 处理任务 [{task.id}]: {task.description}")
-                print(f"   优先级: {task.priority}")
                 if task.notes:
                     print(f"   📋 备注: {task.notes[:50]}...")
                 print(f"{'─' * 50}")
@@ -565,7 +554,6 @@ class LongRunningAgent:
             if current_worker:
                 # 先读取日志，获取执行情况（在终止前）
                 worker_log = current_worker.read_log()
-                activity_summary = current_worker.get_log_summary(max_events=20)
 
                 # 尝试从日志提取成本（即使被中断也可能有 result 事件）
                 if worker_log.cost_usd > 0:
@@ -620,9 +608,7 @@ class LongRunningAgent:
                         self._display_handover_summary(cleanup_result.handover_summary)
                     else:
                         # 没有交接摘要，从日志中生成活动记录
-                        auto_summary = self._generate_activity_summary(
-                            worker_log, activity_summary
-                        )
+                        auto_summary = self._generate_activity_summary(worker_log)
                         self.task_manager.update_notes(task.id, f"中断交接:\n{auto_summary}")
                         print(f"   📋 活动记录已保存到 task.notes")
                         self._display_handover_summary(auto_summary)
@@ -658,7 +644,6 @@ class LongRunningAgent:
 
         # 先读取日志（在终止前）
         worker_log = worker.read_log()
-        activity_summary = worker.get_log_summary(max_events=20)
 
         # 记录 Worker 成本（即使被中断）
         if worker_log.cost_usd > 0:
@@ -703,7 +688,7 @@ class LongRunningAgent:
             self._display_handover_summary(cleanup_result.handover_summary)
         else:
             # 没有交接摘要，从日志中生成活动记录
-            auto_summary = self._generate_activity_summary(worker_log, activity_summary)
+            auto_summary = self._generate_activity_summary(worker_log)
             self.task_manager.update_notes(task.id, f"Supervisor中断:\n{auto_summary}")
             print(f"   📋 活动记录已保存到 task.notes")
             self._display_handover_summary(auto_summary)
@@ -817,58 +802,10 @@ class LongRunningAgent:
         print("🤖 分析需求，生成任务...")
         print("=" * 60)
 
-        # 收集项目上下文
-        context_parts = []
-        print("   📂 收集项目上下文...")
-
-        # 1. 读取 git log 获取历史
-        git_log = self._get_git_context()
-        if git_log and "暂无" not in git_log:
-            context_parts.append(f"### 最近 Git 提交\n{git_log}")
-            print("      \u2713 读取 git log")
-
-        # 2. 获取现有任务描述
-        existing_tasks = self.task_manager.get_all_tasks()
-        if existing_tasks:
-            task_list = "\n".join(
-                [f"- [{t.id}] {t.description} ({t.status})" for t in existing_tasks]
-            )
-            context_parts.append(f"### 现有任务\n{task_list}")
-            print(f"      ✓ 现有 {len(existing_tasks)} 个任务")
-
-        # 3. 获取目录结构
-        try:
-            result = subprocess.run(
-                ["find", ".", "-type", "f", "-name", "*.py", "-o", "-name", "*.js", "-o", "-name", "*.ts"],
-                cwd=self.workspace_dir,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.stdout.strip():
-                files = result.stdout.strip().split("\n")[:20]  # 最多 20 个文件
-                context_parts.append(f"### 项目文件\n" + "\n".join(files))
-                print(f"      ✓ 扫描到 {len(files)} 个代码文件")
-        except:
-            pass
-
-        project_context = "\n\n".join(context_parts) if context_parts else "（新项目，暂无历史）"
-
-        # 获取现有 ID
-        existing_ids = [t.id for t in existing_tasks]
-        ids_str = ", ".join(existing_ids) if existing_ids else "（暂无）"
-
         # 构建 prompt
-        prompt = TASK_GENERATION_PROMPT.format(
-            user_request=user_request,
-            project_context=project_context,
-            existing_ids=ids_str,
-        )
+        prompt = TASK_GENERATION_PROMPT.format(user_request=user_request)
 
-        # 调用 Claude 生成任务（使用流式输出）
-        print("\n   🧠 Claude 分析中...")
-        print("   " + "-" * 40)
-
+        # 调用 Claude（流式输出）
         try:
             process = subprocess.Popen(
                 [
@@ -885,8 +822,6 @@ class LongRunningAgent:
                 cwd=self.workspace_dir,
             )
 
-            # 实时读取输出
-            full_result = ""
             for line in process.stdout:
                 line = line.strip()
                 if not line:
@@ -896,28 +831,23 @@ class LongRunningAgent:
                     evt_type = event.get("type", "")
 
                     if evt_type == "assistant":
-                        # 思考内容
                         content = event.get("message", {}).get("content", [])
                         for block in content:
                             if block.get("type") == "text":
                                 text = block.get("text", "")
-                                # 显示前 80 字符
                                 preview = text[:80].replace("\n", " ")
                                 if preview:
                                     print(f"   💭 {preview}...")
 
                     elif evt_type == "result":
-                        full_result = event.get("result", "")
                         cost = event.get("total_cost_usd", 0)
-                        # 记录任务生成成本
                         if cost > 0:
                             self.cost_tracker.add(
                                 source=CostSource.TASK_GENERATION,
                                 cost_usd=cost,
                                 details="add_task_from_prompt"
                             )
-                        print(f"   " + "-" * 40)
-                        print(f"   💰 成本: ${cost:.4f}")
+                        print(f"\n   💰 成本: ${cost:.4f}")
 
                 except json_module.JSONDecodeError:
                     continue
@@ -926,42 +856,102 @@ class LongRunningAgent:
 
             if process.returncode != 0:
                 stderr = process.stderr.read()
-                print(f"❌ Claude 调用失败: {stderr}")
+                print(f"❌ 调用失败: {stderr}")
                 return False
 
-            # 提取 JSON
-            json_start = full_result.find("[")
-            json_end = full_result.rfind("]") + 1
-            if json_start == -1 or json_end == 0:
-                print(f"❌ 无法解析任务 JSON")
-                print(f"   原始输出: {full_result[:200]}")
-                return False
+            # 验证生成的 tasks.json
+            validation_errors = self._validate_generated_tasks()
+            if validation_errors:
+                print(f"\n   ⚠️  任务格式有误，尝试修复...")
+                if not self._fix_tasks_json(validation_errors):
+                    print(f"❌ 修复调用失败")
+                    return False
+                validation_errors = self._validate_generated_tasks()
+                if validation_errors:
+                    print(f"❌ 任务格式修复失败: {'; '.join(validation_errors)}")
+                    return False
 
-            tasks_data = json_module.loads(full_result[json_start:json_end])
-
-            # 添加任务
-            print("\n   📝 添加任务:")
-            added_count = 0
-            for task_dict in tasks_data:
-                task = Task(
-                    id=task_dict.get("id", f"auto_{len(existing_tasks) + added_count + 1}"),
-                    description=task_dict.get("description", ""),
-                    priority=task_dict.get("priority", 99),
-                    steps=task_dict.get("steps", []),
-                )
-                self.task_manager.add_task(task)
-                added_count += 1
-                print(f"      ✅ [{task.id}] {task.description}")
-
-            print(f"\n✅ 成功添加 {added_count} 个任务")
+            # 重新加载任务
+            self.task_manager._load_tasks()
+            self._show_generated_tasks()
+            print(f"\n✅ 任务添加成功！")
             print(f"   运行 'python3 main.py run' 开始执行")
             return True
 
-        except json_module.JSONDecodeError as e:
-            print(f"❌ JSON 解析失败: {e}")
-            return False
         except Exception as e:
             print(f"❌ 生成失败: {e}")
+            return False
+
+    def _validate_generated_tasks(self) -> list:
+        """验证 tasks.json 格式，返回错误列表（空 = 通过）"""
+        import json as json_module
+        try:
+            with open(self.tasks_file, "r", encoding="utf-8") as f:
+                data = json_module.load(f)
+        except json_module.JSONDecodeError as e:
+            return [f"JSON 解析失败: {e}"]
+        except FileNotFoundError:
+            return ["tasks.json 不存在"]
+
+        if not isinstance(data, list):
+            return ["tasks.json 应该是一个数组"]
+
+        errors = []
+        ids = []
+        for i, task in enumerate(data):
+            if not task.get("id"):
+                errors.append(f"任务[{i}] 缺少 id")
+            else:
+                # 检查 ID 格式（路径编码）
+                task_id = task["id"]
+                parts = task_id.split('.')
+                for part in parts:
+                    if not part.isdigit():
+                        errors.append(f"任务[{i}] ID 格式错误: '{task_id}'，应为数字路径编码")
+                        break
+                if task_id in ids:
+                    errors.append(f"任务 ID 重复: {task_id}")
+                ids.append(task_id)
+            if not task.get("description"):
+                errors.append(f"任务[{i}] 缺少 description")
+
+        return errors
+
+    def _fix_tasks_json(self, errors: list) -> bool:
+        """调用 Claude 修复 tasks.json 格式问题"""
+        import json as json_module
+        prompt = TASKS_FIX_PROMPT.format(
+            errors="\n".join(f"- {e}" for e in errors)
+        )
+
+        try:
+            result = subprocess.run(
+                [
+                    CLAUDE_CMD,
+                    "-p",
+                    "--output-format", "json",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=self.workspace_dir,
+            )
+
+            if result.returncode != 0:
+                return False
+
+            output_data = json_module.loads(result.stdout)
+            cost = output_data.get("total_cost_usd", 0)
+            if cost > 0:
+                self.cost_tracker.add(
+                    source=CostSource.TASK_GENERATION,
+                    cost_usd=cost,
+                    details="fix_tasks_json"
+                )
+            return True
+
+        except Exception:
             return False
 
     def reset(self):

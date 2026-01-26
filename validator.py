@@ -65,7 +65,6 @@ class PostWorkValidator:
     def _run_post_work(self, task) -> ValidationResult:
         """调用 Claude 执行 post-work"""
         prompt = POST_WORK_PROMPT.format(
-            task_id=task.id,
             task_description=task.description,
         )
 
