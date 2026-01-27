@@ -27,6 +27,7 @@ from config import (
     TASKS_REVISION_PROMPT,
     LEARN_PROMPT,
     TaskStatus,
+    truncate_for_display,
 )
 from task_manager import TaskManager, Task
 from worker import WorkerProcess
@@ -208,14 +209,14 @@ class LongRunningAgent:
             inp = evt.get("input", "")
             # 工具调用用蓝色高亮
             if inp:
-                print(f"   [{elapsed_str}] \033[36m🔧 {name}\033[0m: {inp}")
+                print(f"   [{elapsed_str}] \033[36m🔧 {name}\033[0m: {truncate_for_display(inp)}")
             else:
                 print(f"   [{elapsed_str}] \033[36m🔧 {name}\033[0m")
 
         elif evt_type == "text":
             content = evt.get("content", "")
             # 思考内容用灰色
-            print(f"   [{elapsed_str}] \033[90m💭 {content}\033[0m")
+            print(f"   [{elapsed_str}] \033[90m💭 {truncate_for_display(content)}\033[0m")
 
         elif evt_type == "result":
             is_error = evt.get("is_error", False)
@@ -253,7 +254,7 @@ class LongRunningAgent:
                 name = evt.get("name", "")
                 inp = evt.get("input", "")
                 if inp:
-                    lines.append(f"- {name}: {inp[:60]}")
+                    lines.append(f"- {name}: {truncate_for_display(inp)}")
                 else:
                     lines.append(f"- {name}")
             lines.append("")
@@ -265,7 +266,7 @@ class LongRunningAgent:
             # 只取最后一个有意义的思考
             last_thought = text_events[-1].get("content", "")
             if last_thought:
-                lines.append(last_thought[:200])
+                lines.append(truncate_for_display(last_thought))
             lines.append("")
 
         lines.append("## 下一步建议")
@@ -436,7 +437,7 @@ class LongRunningAgent:
                 print(f"\n{'─' * 50}")
                 print(f"📝 处理任务 [{task.id}]: {task.description}")
                 if task.notes:
-                    print(f"   📋 备注: {task.notes[:50]}...")
+                    print(f"   📋 备注: {truncate_for_display(task.notes)}")
                 print(f"{'─' * 50}")
 
                 # 创建并启动 Worker
@@ -835,9 +836,9 @@ class LongRunningAgent:
                         for block in content:
                             if block.get("type") == "text":
                                 text = block.get("text", "")
-                                preview = text[:80].replace("\n", " ")
+                                preview = truncate_for_display(text)
                                 if preview:
-                                    print(f"   💭 {preview}...")
+                                    print(f"   💭 {preview}")
 
                     elif evt_type == "result":
                         cost = event.get("total_cost_usd", 0)
@@ -1118,9 +1119,9 @@ class LongRunningAgent:
                         for block in content:
                             if block.get("type") == "text":
                                 text = block.get("text", "")
-                                preview = text[:60].replace("\n", " ")
+                                preview = truncate_for_display(text)
                                 if preview:
-                                    print(f"   💭 {preview}...")
+                                    print(f"   💭 {preview}")
 
                     elif evt_type == "result":
                         full_result = event.get("result", "")
@@ -1221,9 +1222,9 @@ class LongRunningAgent:
                         for block in content:
                             if block.get("type") == "text":
                                 text = block.get("text", "")
-                                preview = text[:80].replace("\n", " ")
+                                preview = truncate_for_display(text)
                                 if preview:
-                                    print(f"   💭 {preview}...")
+                                    print(f"   💭 {preview}")
 
                     elif evt_type == "result":
                         result = event.get("result", "")

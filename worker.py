@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 from task_manager import Task
-from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE
+from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE, truncate_for_display
 
 
 @dataclass
@@ -361,12 +361,13 @@ class WorkerProcess:
                     text = block.get("text", "").strip()
                     if text:
                         # 避免重复添加相同的文本（流式更新可能重复）
+                        display_text = truncate_for_display(text)
                         if (
                             not result.events
-                            or result.events[-1].get("content") != text[:150]
+                            or result.events[-1].get("content") != display_text
                         ):
                             result.events.append(
-                                {"type": "text", "content": text[:150]}  # 截断长文本
+                                {"type": "text", "content": display_text}
                             )
                 elif block_type == "tool_use":
                     tool_name = block.get("name", "unknown")
@@ -376,14 +377,14 @@ class WorkerProcess:
                     input_summary = ""
                     if isinstance(tool_input, dict):
                         if tool_name == "Bash":
-                            input_summary = tool_input.get("command", "")[:80]
+                            input_summary = truncate_for_display(tool_input.get("command", ""))
                         elif tool_name in ("Read", "Write", "Edit"):
                             path = tool_input.get("file_path", "")
                             input_summary = os.path.basename(path)
                         elif tool_name == "Grep":
-                            input_summary = tool_input.get("pattern", "")[:50]
+                            input_summary = truncate_for_display(tool_input.get("pattern", ""))
                         elif tool_name == "Glob":
-                            input_summary = tool_input.get("pattern", "")[:50]
+                            input_summary = truncate_for_display(tool_input.get("pattern", ""))
 
                     result.events.append(
                         {"type": "tool", "name": tool_name, "input": input_summary}
@@ -442,7 +443,7 @@ class WorkerProcess:
                 if block_type == "text":
                     text = block.get("text", "").strip()
                     if text and len(text) > 10:  # 忽略太短的文本
-                        return {"type": "text", "content": text[:100]}
+                        return {"type": "text", "content": truncate_for_display(text)}
                 elif block_type == "tool_use":
                     tool_name = block.get("name", "unknown")
                     tool_input = block.get("input", {})
@@ -451,8 +452,8 @@ class WorkerProcess:
 
         elif event_type == "result":
             is_error = event.get("is_error", False)
-            result_text = event.get("result", "")[:50]
-            return {"type": "result", "is_error": is_error, "result": result_text}
+            result_text = event.get("result", "")
+            return {"type": "result", "is_error": is_error, "result": truncate_for_display(result_text)}
 
         return None
 
@@ -462,38 +463,31 @@ class WorkerProcess:
             return ""
 
         if tool_name == "Bash":
-            cmd = tool_input.get("command", "")
-            # 提取命令的关键部分
-            if len(cmd) > 60:
-                return cmd[:57] + "..."
-            return cmd
+            return truncate_for_display(tool_input.get("command", ""))
         elif tool_name in ("Read", "Write", "Edit"):
             path = tool_input.get("file_path", "")
             return os.path.basename(path)
         elif tool_name == "Grep":
-            pattern = tool_input.get("pattern", "")[:30]
+            pattern = truncate_for_display(tool_input.get("pattern", ""))
             path = tool_input.get("path", "")
             if path:
                 return f"{pattern} in {os.path.basename(path)}"
             return pattern
         elif tool_name == "Glob":
-            return tool_input.get("pattern", "")[:40]
+            return truncate_for_display(tool_input.get("pattern", ""))
         elif tool_name == "Task":
-            return tool_input.get("description", "")[:40]
+            return truncate_for_display(tool_input.get("description", ""))
         elif tool_name == "WebFetch":
             url = tool_input.get("url", "")
-            # 提取域名
             if "://" in url:
                 url = url.split("://")[1].split("/")[0]
-            return url[:40]
+            return truncate_for_display(url)
         elif tool_name == "WebSearch":
-            return tool_input.get("query", "")[:40]
+            return truncate_for_display(tool_input.get("query", ""))
         else:
-            # 尝试获取第一个有意义的值
             for key in ["pattern", "query", "command", "file_path", "path"]:
                 if key in tool_input:
-                    val = str(tool_input[key])[:40]
-                    return val
+                    return truncate_for_display(str(tool_input[key]))
         return ""
 
     def get_log_summary(self, max_events: int = 30) -> str:

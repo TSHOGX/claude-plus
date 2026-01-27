@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from config import CLAUDE_CMD, ORCHESTRATOR_PROMPT, ORCHESTRATOR_REVIEW_PROMPT
+from config import CLAUDE_CMD, ORCHESTRATOR_PROMPT, ORCHESTRATOR_REVIEW_PROMPT, truncate_for_display
 
 
 @dataclass
@@ -185,9 +185,9 @@ class TaskOrchestrator:
                         for block in content:
                             if block.get("type") == "text":
                                 text = block.get("text", "")
-                                preview = text[:60].replace("\n", " ")
+                                preview = truncate_for_display(text)
                                 if preview:
-                                    print(f"      💭 {preview}...")
+                                    print(f"      💭 {preview}")
 
                     elif evt_type == "content_block_start" and self.verbose:
                         # 工具调用开始

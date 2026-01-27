@@ -3,6 +3,7 @@
 """
 
 import os
+import shutil
 
 # 默认工作目录
 DEFAULT_WORKSPACE_DIR = os.path.join(
@@ -37,6 +38,27 @@ CLAUDE_CMD = "claude"
 
 # Supervisor 配置
 CHECK_INTERVAL = 1800  # Supervisor 检查间隔（秒），默认 30 分钟
+
+
+def get_display_width() -> int:
+    """根据终端宽度动态计算文本显示长度（80%可用宽度）"""
+    try:
+        terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    except Exception:
+        terminal_width = 80
+    # 预留前缀(25) + 后缀(5) 空间
+    return max(40, int((terminal_width - 30) * 0.8))
+
+
+def truncate_for_display(text: str) -> str:
+    """截断文本用于终端显示，换行替换为空格"""
+    if not text:
+        return ""
+    text = text.replace("\n", " ").strip()
+    max_width = get_display_width()
+    if len(text) <= max_width:
+        return text
+    return text[:max_width] + "..."
 
 # 任务状态
 class TaskStatus:
