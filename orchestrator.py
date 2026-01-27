@@ -273,7 +273,7 @@ class TaskOrchestrator:
             capture_output=True
         )
 
-        commit_msg = f"TaskOrchestrator: {trigger}"
+        commit_msg = f"chore(orchestrator): {trigger}"
         result = subprocess.run(
             ["git", "commit", "-m", commit_msg],
             cwd=self.workspace_dir,

@@ -286,3 +286,34 @@ ORCHESTRATOR_REVIEW_PROMPT = """请审视你刚才对任务列表的修改。
 如果发现问题，请修复。
 如果没有问题，输出 REVIEW_PASSED
 """
+
+# Learn 命令提示模板
+LEARN_PROMPT = """用户希望你学习一条建议，并更新 CLAUDE.md。
+
+## 用户建议
+{suggestion}
+
+## 你的任务
+1. 阅读当前 CLAUDE.md
+2. 探索 codebase 理解项目结构和规范
+3. 根据用户建议，在 CLAUDE.md 中添加合适的指导语句
+
+## 原则
+- 保持简洁，避免冗余
+- 新增内容应与现有内容风格一致
+- 如果建议已被覆盖，无需重复添加
+
+完成后输出 LEARNED
+"""
+
+# 任务修订提示模板（用于根据用户反馈修改任务列表）
+TASKS_REVISION_PROMPT = """用户对任务列表提出了反馈，请根据反馈修改 tasks.json：
+
+## 用户反馈
+{feedback}
+
+## 要求
+1. 根据用户反馈修改 tasks.json
+2. 保持任务 ID 格式规范（路径编码）
+3. 修改完成后输出 TASKS_CREATED 确认
+"""

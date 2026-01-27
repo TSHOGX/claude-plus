@@ -24,6 +24,9 @@ from config import (
     TASK_GENERATION_PROMPT,
     TASKS_CREATION_PROMPT,
     TASKS_FIX_PROMPT,
+    TASKS_REVISION_PROMPT,
+    LEARN_PROMPT,
+    TaskStatus,
 )
 from task_manager import TaskManager, Task
 from worker import WorkerProcess
@@ -68,7 +71,7 @@ class LongRunningAgent:
             # 提交现有文件（保护原有代码）
             existing_files = self._count_files()
             if existing_files > 0:
-                self._git_commit(f"初始快照: 保护现有 {existing_files} 个文件")
+                self._git_commit(f"chore: initial snapshot of {existing_files} existing files")
                 print(f"✓ 已提交现有 {existing_files} 个文件作为初始快照")
         else:
             print("✓ Git 仓库已存在")
@@ -113,7 +116,7 @@ class LongRunningAgent:
 
         # 6. 提交初始化脚本等配置文件
         if self._has_uncommitted_changes():
-            self._git_commit("添加任务管理配置文件")
+            self._git_commit("chore: add task management configuration files")
             print("✓ 配置文件已提交")
 
         print("\n初始化完成！")
@@ -335,12 +338,10 @@ class LongRunningAgent:
 
     def _has_failed_tasks(self) -> bool:
         """检查是否有失败的任务"""
-        from config import TaskStatus
         return any(t.status == TaskStatus.FAILED for t in self.task_manager.get_all_tasks())
 
     def _get_failed_tasks_summary(self) -> str:
         """获取失败任务摘要"""
-        from config import TaskStatus
         failed = [t for t in self.task_manager.get_all_tasks() if t.status == TaskStatus.FAILED]
         if not failed:
             return "无失败任务"
@@ -351,7 +352,6 @@ class LongRunningAgent:
 
     def _print_failed_tasks_detail(self):
         """打印失败任务详情（供用户排查）"""
-        from config import TaskStatus
         failed = [t for t in self.task_manager.get_all_tasks() if t.status == TaskStatus.FAILED]
         if not failed:
             return
@@ -971,7 +971,7 @@ class LongRunningAgent:
             print(f"❌ 未找到任务: {task_id}")
 
     def create_tasks_from_prompt(self, user_request: str) -> bool:
-        """根据用户需求，让 Claude 生成 tasks.json"""
+        """根据用户需求生成 tasks.json，支持交互式反馈循环"""
         import json as json_module
 
         print("\n" + "=" * 60)
@@ -990,31 +990,65 @@ class LongRunningAgent:
         prompt = TASKS_CREATION_PROMPT.format(user_request=user_request)
 
         # 调用 Claude Code（在 workspace 目录下）
-        result = self._call_claude_for_creation(prompt)
+        result, session_id = self._call_claude_for_creation(prompt)
 
-        if result and "TASKS_CREATED" in result:
+        # 交互式反馈循环
+        while True:
+            if not (result and "TASKS_CREATED" in result):
+                print("\n❌ 任务生成失败")
+                return False
+
             # 校验生成的 tasks.json
-            if self._validate_tasks_json():
-                print("\n✅ tasks.json 生成成功！")
-
-                # 显示生成的任务列表
-                self._show_generated_tasks()
-
-                # 询问用户是否提交
-                confirm_commit = input("\n是否提交到 Git？(y/N): ").strip().lower()
-                if confirm_commit == 'y':
-                    self._git_commit("初始化任务列表")
-                    print("✅ 已提交")
-                else:
-                    print("ℹ️  未提交，你可以稍后手动提交")
-
-                return True
-            else:
+            if not self._validate_tasks_json():
                 print("\n❌ 生成的 tasks.json 格式无效")
                 return False
+
+            print("\n✅ tasks.json 生成成功！")
+
+            # 显示生成的任务列表
+            self._show_generated_tasks()
+
+            # 询问用户反馈
+            print("\n" + "-" * 40)
+            print("请确认任务列表：")
+            print("  - 输入 y 确认并继续")
+            print("  - 输入反馈文字，Claude 将根据反馈修改任务列表")
+            print("-" * 40)
+
+            user_input = input("\n确认或反馈: ").strip()
+
+            if user_input.lower() == 'y':
+                # 用户确认，跳出循环
+                break
+            elif user_input == '':
+                # 空输入视为取消
+                print("已取消")
+                return False
+            else:
+                # 用户提供反馈，resume session 修改任务
+                if not session_id:
+                    print("⚠️  无法获取会话 ID，无法 resume 修改")
+                    print("请手动修改 tasks.json 后重新运行")
+                    return False
+
+                print("\n" + "=" * 60)
+                print("🔄 Claude 正在根据反馈修改任务列表...")
+                print("=" * 60)
+
+                result, session_id = self._call_claude_for_revision(
+                    session_id, user_input
+                )
+                # 循环继续，重新展示修改后的任务列表
+
+        # 用户确认后，询问是否提交
+        confirm_commit = input("\n是否提交到 Git？(y/N): ").strip().lower()
+        if confirm_commit == 'y':
+            self._git_commit("feat: initialize task list")
+            print("✅ 已提交")
         else:
-            print("\n❌ 任务生成失败")
-            return False
+            print("ℹ️  未提交，你可以稍后手动提交")
+
+        return True
 
     def _show_generated_tasks(self):
         """显示生成的任务列表"""
@@ -1037,19 +1071,26 @@ class LongRunningAgent:
         except Exception:
             pass
 
-    def _call_claude_for_creation(self, prompt: str):
-        """调用 Claude Code 生成任务（流式输出）"""
+    def _call_claude_for_creation(self, prompt: str, resume_session_id: str = None):
+        """调用 Claude Code 生成任务，返回 (result, session_id)"""
         import json as json_module
         try:
+            cmd = [
+                CLAUDE_CMD,
+                "-p",
+                "--verbose",
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",
+            ]
+
+            # 如果提供了 session_id，使用 --resume
+            if resume_session_id:
+                cmd.extend(["--resume", resume_session_id])
+
+            cmd.append(prompt)
+
             process = subprocess.Popen(
-                [
-                    CLAUDE_CMD,
-                    "-p",
-                    "--verbose",
-                    "--output-format", "stream-json",
-                    "--dangerously-skip-permissions",
-                    prompt,
-                ],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1057,6 +1098,8 @@ class LongRunningAgent:
             )
 
             full_result = ""
+            session_id = None
+
             for line in process.stdout:
                 line = line.strip()
                 if not line:
@@ -1065,7 +1108,11 @@ class LongRunningAgent:
                     event = json_module.loads(line)
                     evt_type = event.get("type", "")
 
-                    if evt_type == "assistant":
+                    # 从 system init 事件中获取 session_id
+                    if evt_type == "system" and event.get("subtype") == "init":
+                        session_id = event.get("session_id")
+
+                    elif evt_type == "assistant":
                         # 显示思考过程摘要
                         content = event.get("message", {}).get("content", [])
                         for block in content:
@@ -1077,6 +1124,8 @@ class LongRunningAgent:
 
                     elif evt_type == "result":
                         full_result = event.get("result", "")
+                        # 从 result 事件也可以获取 session_id
+                        session_id = event.get("session_id", session_id)
                         cost = event.get("total_cost_usd", 0)
                         # 记录任务创建成本
                         if cost > 0:
@@ -1091,11 +1140,16 @@ class LongRunningAgent:
                     continue
 
             process.wait()
-            return full_result
+            return full_result, session_id
 
         except Exception as e:
             print(f"❌ 调用失败: {e}")
-            return None
+            return None, None
+
+    def _call_claude_for_revision(self, session_id: str, feedback: str):
+        """Resume session 根据用户反馈修改任务列表"""
+        prompt = TASKS_REVISION_PROMPT.format(feedback=feedback)
+        return self._call_claude_for_creation(prompt, resume_session_id=session_id)
 
     def _validate_tasks_json(self) -> bool:
         """校验 tasks.json 格式"""
@@ -1126,6 +1180,80 @@ class LongRunningAgent:
             return False
         except Exception as e:
             print(f"   ⚠️  校验异常: {e}")
+            return False
+
+    def learn(self, suggestion: str) -> bool:
+        """根据用户建议更新 CLAUDE.md"""
+        import json as json_module
+
+        print("\n" + "=" * 60)
+        print("📚 Claude 正在学习并更新 CLAUDE.md...")
+        print("=" * 60)
+
+        prompt = LEARN_PROMPT.format(suggestion=suggestion)
+
+        try:
+            process = subprocess.Popen(
+                [
+                    CLAUDE_CMD,
+                    "-p",
+                    "--verbose",
+                    "--output-format", "stream-json",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=self.workspace_dir,
+            )
+
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json_module.loads(line)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "assistant":
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                preview = text[:80].replace("\n", " ")
+                                if preview:
+                                    print(f"   💭 {preview}...")
+
+                    elif evt_type == "result":
+                        result = event.get("result", "")
+                        cost = event.get("total_cost_usd", 0)
+                        if cost > 0:
+                            self.cost_tracker.add(
+                                source=CostSource.TASK_GENERATION,
+                                cost_usd=cost,
+                                details="learn"
+                            )
+                        print(f"\n   💰 成本: ${cost:.4f}")
+
+                        if "LEARNED" in result:
+                            print("\n✅ CLAUDE.md 已更新！")
+                            return True
+
+                except json_module.JSONDecodeError:
+                    continue
+
+            process.wait()
+
+            if process.returncode != 0:
+                stderr = process.stderr.read()
+                print(f"❌ 调用失败: {stderr}")
+                return False
+
+            return True
+
+        except Exception as e:
+            print(f"❌ 学习失败: {e}")
             return False
 
 
@@ -1178,6 +1306,10 @@ def main():
     add_parser = subparsers.add_parser("add", help="根据描述新增任务")
     add_parser.add_argument("description", help="任务需求描述")
 
+    # learn 命令
+    learn_parser = subparsers.add_parser("learn", help="学习建议并更新 CLAUDE.md")
+    learn_parser.add_argument("suggestion", help="要学习的建议")
+
     args = parser.parse_args()
 
     # 安全检查
@@ -1205,6 +1337,8 @@ def main():
         agent.reset_single_task(args.task_id)
     elif args.command == "add":
         agent.add_task_from_prompt(args.description)
+    elif args.command == "learn":
+        agent.learn(args.suggestion)
     else:
         parser.print_help()
 

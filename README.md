@@ -134,6 +134,7 @@ python3 main.py -w ~/my-project status
 | `run` | 运行任务处理 |
 | `status` | 显示当前状态 |
 | `add "描述"` | 根据自然语言描述追加任务到现有列表 |
+| `learn "建议"` | 学习建议并自动更新 CLAUDE.md |
 | `reset` | 重置所有任务 |
 | `reset-task <id>` | 重置单个任务 |
 
