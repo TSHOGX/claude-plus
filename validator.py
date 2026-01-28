@@ -6,12 +6,12 @@
 - 解析结果判断是否成功
 """
 
-import json
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List
 
-from config import CLAUDE_CMD, POST_WORK_PROMPT, truncate_for_display, summarize_tool_input
+from config import POST_WORK_PROMPT
+from claude_runner import run_claude, make_printer
 
 
 @dataclass
@@ -81,71 +81,22 @@ class PostWorkValidator:
         if retry_context:
             prompt += f"\n\n## 重试上下文\n{retry_context}\n请确保所有文件都被 commit 或加入 .gitignore"
 
-        cost_usd = 0.0
-        try:
-            print("   🔍 执行验证和提交...")
-            process = subprocess.Popen(
-                [
-                    CLAUDE_CMD,
-                    "-p",
-                    "--verbose",
-                    "--output-format", "stream-json",
-                    "--dangerously-skip-permissions",
-                    prompt,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=self.workspace_dir,
-            )
+        print("   🔍 执行验证和提交...")
+        result = run_claude(
+            prompt,
+            workspace_dir=self.workspace_dir,
+            callbacks=make_printer(indent=6, verbose=True),
+        )
 
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    evt_type = event.get("type", "")
+        if result.is_error:
+            print(f"   ⚠️  Claude 调用失败")
+            return ValidationResult(success=False, errors=["Claude 调用失败"], cost_usd=result.cost_usd)
 
-                    if evt_type == "assistant":
-                        # 显示思考过程和工具调用
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                preview = truncate_for_display(text)
-                                if preview:
-                                    print(f"      💭 {preview}")
-                            elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "")
-                                inp = summarize_tool_input(tool_name, block.get("input", {}))
-                                if inp:
-                                    print(f"      🔧 {tool_name}: {inp}")
-                                else:
-                                    print(f"      🔧 {tool_name}")
-
-                    elif evt_type == "result":
-                        cost_usd = event.get("total_cost_usd", 0.0)
-                        print(f"      💰 成本: ${cost_usd:.4f}")
-
-                except json.JSONDecodeError:
-                    continue
-
-            process.wait()
-
-            if process.returncode != 0:
-                print(f"   ⚠️  Claude 调用失败")
-                return ValidationResult(success=False, errors=["Claude 调用失败"])
-
-            # 通过 git status 判断是否完成
-            if not self._get_changed_files():
-                print("   ✅ 验证通过，已提交")
-                self.task_manager.clear_notes(task.id)
-                return ValidationResult(success=True, cost_usd=cost_usd)
-            else:
-                print("   ⚠️  仍有未提交的改动")
-                return ValidationResult(success=False, errors=["仍有未提交的改动"], cost_usd=cost_usd)
-
-        except Exception as e:
-            print(f"   ⚠️  执行失败: {e}")
-            return ValidationResult(success=False, errors=[str(e)], cost_usd=cost_usd)
+        # 通过 git status 判断是否完成
+        if not self._get_changed_files():
+            print("   ✅ 验证通过，已提交")
+            self.task_manager.clear_notes(task.id)
+            return ValidationResult(success=True, cost_usd=result.cost_usd)
+        else:
+            print("   ⚠️  仍有未提交的改动")
+            return ValidationResult(success=False, errors=["仍有未提交的改动"], cost_usd=result.cost_usd)

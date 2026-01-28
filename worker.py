@@ -8,15 +8,23 @@ WorkerProcess 封装 Claude CLI 的后台执行，提供：
 - 状态检查
 """
 
-import os
 import json
+import os
 import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, List
 from task_manager import Task
-from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE, truncate_for_display, summarize_tool_input
+from config import SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE
+from claude_runner import (
+    start_claude_background,
+    resume_claude_background,
+    parse_log_file,
+    IncrementalLogReader,
+    ParsedLog,
+)
 
 
 @dataclass
@@ -59,8 +67,7 @@ class WorkerProcess:
         self.log_file = os.path.join(self.logs_dir, f"worker_{task.id}.log")
         self.start_time: Optional[float] = None
         # 实时日志追踪
-        self._last_log_position: int = 0
-        self._last_event_count: int = 0
+        self._log_reader: Optional[IncrementalLogReader] = None
 
     def _build_system_prompt(self) -> str:
         """构建系统提示"""
@@ -86,31 +93,15 @@ class WorkerProcess:
         system_prompt = self._build_system_prompt()
         task_prompt = self._build_task_prompt()
 
-        cmd = [
-            CLAUDE_CMD,
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-            "--append-system-prompt",
-            system_prompt,
+        self.process = start_claude_background(
             task_prompt,
-        ]
-
-        # 打开日志文件
-        log_f = open(self.log_file, "w")
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            cwd=self.workspace_dir,
-            env={**os.environ, "NO_COLOR": "1"},
-            start_new_session=True,  # 独立进程组
+            workspace_dir=self.workspace_dir,
+            log_file=Path(self.log_file),
+            system_prompt=system_prompt,
         )
 
         self.start_time = time.time()
+        self._log_reader = IncrementalLogReader(Path(self.log_file))
         return self.process.pid
 
     def is_alive(self) -> bool:
@@ -208,34 +199,21 @@ class WorkerProcess:
         # 4. 使用 --resume 恢复会话，发送清理指令
         print(f"      🧹 正在执行清理工作...")
         cleanup_prompt = CLEANUP_PROMPT_TEMPLATE.format(reason=reason)
-
-        cleanup_log_file = self.log_file.replace(".log", "_cleanup.log")
-
-        cmd = [
-            CLAUDE_CMD,
-            "-p",
-            "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
-            "--resume", session_id,
-            cleanup_prompt,
-        ]
+        cleanup_log_file = Path(self.log_file.replace(".log", "_cleanup.log"))
 
         try:
-            with open(cleanup_log_file, "w") as log_f:
-                cleanup_proc = subprocess.Popen(
-                    cmd,
-                    stdout=log_f,
-                    stderr=subprocess.STDOUT,
-                    cwd=self.workspace_dir,
-                    env={**os.environ, "NO_COLOR": "1"},
-                    start_new_session=True,
-                )
+            cleanup_proc = resume_claude_background(
+                cleanup_prompt,
+                workspace_dir=self.workspace_dir,
+                log_file=cleanup_log_file,
+                session_id=session_id,
+            )
 
             # 等待清理完成
             cleanup_proc.wait()
 
             # 5. 解析清理日志，提取交接摘要
-            result = self._parse_cleanup_log(cleanup_log_file)
+            result = self._parse_cleanup_log(str(cleanup_log_file))
 
             if result.cleanup_done:
                 print(f"      ✅ 清理工作已完成")
@@ -322,128 +300,24 @@ class WorkerProcess:
 
     def read_log(self) -> WorkerLog:
         """读取并解析日志文件"""
-        result = WorkerLog()
-
-        if not os.path.exists(self.log_file):
-            return result
-
-        try:
-            with open(self.log_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        self._parse_event(event, result)
-                    except json.JSONDecodeError:
-                        continue
-        except Exception:
-            pass
-
-        return result
-
-    def _parse_event(self, event: dict, result: WorkerLog):
-        """解析单个 stream-json 事件，按时序记录"""
-        event_type = event.get("type", "")
-
-        if event_type == "system":
-            subtype = event.get("subtype", "")
-            if subtype == "init":
-                result.session_id = event.get("session_id")
-                result.model = event.get("model")
-
-        elif event_type == "assistant":
-            message = event.get("message", {})
-            for block in message.get("content", []):
-                block_type = block.get("type", "")
-                if block_type == "text":
-                    text = block.get("text", "").strip()
-                    if text:
-                        # 避免重复添加相同的文本（流式更新可能重复）
-                        display_text = truncate_for_display(text)
-                        if (
-                            not result.events
-                            or result.events[-1].get("content") != display_text
-                        ):
-                            result.events.append(
-                                {"type": "text", "content": display_text}
-                            )
-                elif block_type == "tool_use":
-                    tool_name = block.get("name", "unknown")
-                    tool_input = block.get("input", {})
-                    input_summary = summarize_tool_input(tool_name, tool_input)
-
-                    result.events.append(
-                        {"type": "tool", "name": tool_name, "input": input_summary}
-                    )
-
-        elif event_type == "result":
-            result.is_complete = True
-            result.is_error = event.get("is_error", False)
-            result.result = event.get("result", "")
-            result.cost_usd = event.get("total_cost_usd", 0.0)
-            result.duration_ms = event.get("duration_ms", 0)
-            result.session_id = event.get("session_id", result.session_id)
+        parsed = parse_log_file(Path(self.log_file))
+        # 转换为 WorkerLog 格式
+        return WorkerLog(
+            session_id=parsed.session_id,
+            model=parsed.model,
+            events=parsed.events,
+            is_complete=parsed.is_complete,
+            is_error=parsed.is_error,
+            result=parsed.result,
+            cost_usd=parsed.cost_usd,
+            duration_ms=parsed.duration_ms,
+        )
 
     def read_new_events(self) -> List[dict]:
-        """增量读取新事件（用于实时显示）
-
-        Returns:
-            新事件列表，每个事件格式为 {"type": "tool"|"text", ...}
-        """
-        if not os.path.exists(self.log_file):
-            return []
-
-        new_events = []
-        try:
-            with open(self.log_file, "r") as f:
-                # 跳到上次读取位置
-                f.seek(self._last_log_position)
-
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        parsed = self._parse_event_for_display(event)
-                        if parsed:
-                            new_events.append(parsed)
-                    except json.JSONDecodeError:
-                        continue
-
-                # 更新位置
-                self._last_log_position = f.tell()
-        except Exception:
-            pass
-
-        return new_events
-
-    def _parse_event_for_display(self, event: dict) -> Optional[dict]:
-        """解析事件用于实时显示"""
-        event_type = event.get("type", "")
-
-        if event_type == "assistant":
-            message = event.get("message", {})
-            for block in message.get("content", []):
-                block_type = block.get("type", "")
-                if block_type == "text":
-                    text = block.get("text", "").strip()
-                    if text and len(text) > 10:  # 忽略太短的文本
-                        return {"type": "text", "content": truncate_for_display(text)}
-                elif block_type == "tool_use":
-                    tool_name = block.get("name", "unknown")
-                    tool_input = block.get("input", {})
-                    input_summary = summarize_tool_input(tool_name, tool_input)
-                    return {"type": "tool", "name": tool_name, "input": input_summary}
-
-        elif event_type == "result":
-            is_error = event.get("is_error", False)
-            result_text = event.get("result", "")
-            return {"type": "result", "is_error": is_error, "result": truncate_for_display(result_text)}
-
-        return None
+        """增量读取新事件（用于实时显示）"""
+        if self._log_reader is None:
+            self._log_reader = IncrementalLogReader(Path(self.log_file))
+        return self._log_reader.read_new_events()
 
     def get_log_summary(self, max_events: int = 30) -> str:
         """获取日志摘要（用于 Supervisor 分析）- 按时序展示执行流程"""

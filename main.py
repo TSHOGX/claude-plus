@@ -20,15 +20,14 @@ from config import (
     CHECK_INTERVAL,
     get_paths,
     is_safe_workspace,
-    CLAUDE_CMD,
     TASK_MODIFICATION_PROMPT,
     TASKS_CREATION_PROMPT,
     TASKS_REVISION_PROMPT,
     LEARN_PROMPT,
     TaskStatus,
     truncate_for_display,
-    summarize_tool_input,
 )
+from claude_runner import run_claude, make_printer, EventCallbacks
 from task_manager import TaskManager, Task
 from worker import WorkerProcess
 from supervisor import Supervisor, Decision, SupervisorResult
@@ -80,8 +79,9 @@ class LongRunningAgent:
             if self._has_uncommitted_changes():
                 print("⚠️  检测到未提交的更改，建议先手动提交")
 
-        # 确保 .claude_plus/ 在 .gitignore 中
+        # 确保 .claude_plus/ 和 CLAUDE.md 在 .gitignore 中
         self._ensure_gitignore_entry(".claude_plus/")
+        self._ensure_gitignore_entry("CLAUDE.md")
 
         # 3. 检查任务文件（不自动创建）
         if not os.path.exists(self.tasks_file):
@@ -867,80 +867,49 @@ class LongRunningAgent:
 
     def _call_claude_for_modification(self, prompt: str, resume_session_id: str = None):
         """调用 Claude Code 修改任务，返回 (result, session_id)"""
-        import json as json_module
-        try:
-            cmd = [
-                CLAUDE_CMD,
-                "-p",
-                "--verbose",
-                "--output-format", "stream-json",
-                "--dangerously-skip-permissions",
-            ]
+        return self._call_claude(prompt, resume_session_id, cost_details="add_task_from_prompt")
 
-            if resume_session_id:
-                cmd.extend(["--resume", resume_session_id])
+    def _call_claude(self, prompt: str, resume_session_id: str = None, cost_details: str = ""):
+        """统一的 Claude 调用方法"""
+        # 自定义回调以获取 session_id 和记录成本
+        session_id = None
+        cost_usd = 0.0
 
-            cmd.append(prompt)
+        def on_init(sid):
+            nonlocal session_id
+            session_id = sid
 
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=self.workspace_dir,
-            )
+        def on_result(text, cost):
+            nonlocal session_id, cost_usd
+            cost_usd = cost
+            if cost > 0:
+                self.cost_tracker.add(
+                    source=CostSource.TASK_GENERATION,
+                    cost_usd=cost,
+                    details=cost_details
+                )
+            print(f"\n   💰 成本: ${cost:.4f}")
 
-            full_result = ""
-            session_id = None
+        callbacks = EventCallbacks(
+            on_init=on_init,
+            on_text=lambda t: print(f"   💭 {t}"),
+            on_tool=lambda n, i: print(f"   🔧 {n}: {i}" if i else f"   🔧 {n}"),
+            on_result=on_result,
+        )
 
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json_module.loads(line)
-                    evt_type = event.get("type", "")
+        result = run_claude(
+            prompt,
+            workspace_dir=self.workspace_dir,
+            resume_session_id=resume_session_id,
+            callbacks=callbacks,
+        )
 
-                    if evt_type == "system" and event.get("subtype") == "init":
-                        session_id = event.get("session_id")
-
-                    elif evt_type == "assistant":
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                preview = truncate_for_display(text)
-                                if preview:
-                                    print(f"   💭 {preview}")
-                            elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "")
-                                inp = summarize_tool_input(tool_name, block.get("input", {}))
-                                if inp:
-                                    print(f"   🔧 {tool_name}: {inp}")
-                                else:
-                                    print(f"   🔧 {tool_name}")
-
-                    elif evt_type == "result":
-                        full_result = event.get("result", "")
-                        session_id = event.get("session_id", session_id)
-                        cost = event.get("total_cost_usd", 0)
-                        if cost > 0:
-                            self.cost_tracker.add(
-                                source=CostSource.TASK_GENERATION,
-                                cost_usd=cost,
-                                details="add_task_from_prompt"
-                            )
-                        print(f"\n   💰 成本: ${cost:.4f}")
-
-                except json_module.JSONDecodeError:
-                    continue
-
-            process.wait()
-            return full_result, session_id
-
-        except Exception as e:
-            print(f"❌ 调用失败: {e}")
+        if result.is_error:
+            print(f"❌ 调用失败: {result.result_text}")
             return None, None
+
+        # 优先使用 result 中的 session_id
+        return result.result_text, result.session_id or session_id
 
     def reset(self):
         """重置所有任务状态"""
@@ -982,7 +951,7 @@ class LongRunningAgent:
 
         # 交互式反馈循环
         while True:
-            if not (result and "TASKS_CREATED" in result):
+            if not (result and ("TASKS_CREATED" in result or "TASKS_MODIFIED" in result)):
                 print("\n❌ 任务生成失败")
                 return False
 
@@ -1061,90 +1030,12 @@ class LongRunningAgent:
 
     def _call_claude_for_creation(self, prompt: str, resume_session_id: str = None):
         """调用 Claude Code 生成任务，返回 (result, session_id)"""
-        import json as json_module
-        try:
-            cmd = [
-                CLAUDE_CMD,
-                "-p",
-                "--verbose",
-                "--output-format", "stream-json",
-                "--dangerously-skip-permissions",
-            ]
-
-            # 如果提供了 session_id，使用 --resume
-            if resume_session_id:
-                cmd.extend(["--resume", resume_session_id])
-
-            cmd.append(prompt)
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=self.workspace_dir,
-            )
-
-            full_result = ""
-            session_id = None
-
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json_module.loads(line)
-                    evt_type = event.get("type", "")
-
-                    # 从 system init 事件中获取 session_id
-                    if evt_type == "system" and event.get("subtype") == "init":
-                        session_id = event.get("session_id")
-
-                    elif evt_type == "assistant":
-                        # 显示思考过程和工具调用
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                preview = truncate_for_display(text)
-                                if preview:
-                                    print(f"   💭 {preview}")
-                            elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "")
-                                inp = summarize_tool_input(tool_name, block.get("input", {}))
-                                if inp:
-                                    print(f"   🔧 {tool_name}: {inp}")
-                                else:
-                                    print(f"   🔧 {tool_name}")
-
-                    elif evt_type == "result":
-                        full_result = event.get("result", "")
-                        # 从 result 事件也可以获取 session_id
-                        session_id = event.get("session_id", session_id)
-                        cost = event.get("total_cost_usd", 0)
-                        # 记录任务创建成本
-                        if cost > 0:
-                            self.cost_tracker.add(
-                                source=CostSource.TASK_GENERATION,
-                                cost_usd=cost,
-                                details="create_tasks_from_prompt"
-                            )
-                        print(f"\n   💰 成本: ${cost:.4f}")
-
-                except json_module.JSONDecodeError:
-                    continue
-
-            process.wait()
-            return full_result, session_id
-
-        except Exception as e:
-            print(f"❌ 调用失败: {e}")
-            return None, None
+        return self._call_claude(prompt, resume_session_id, cost_details="create_tasks_from_prompt")
 
     def _call_claude_for_revision(self, session_id: str, feedback: str):
         """Resume session 根据用户反馈修改任务列表"""
         prompt = TASKS_REVISION_PROMPT.format(feedback=feedback)
-        return self._call_claude_for_creation(prompt, resume_session_id=session_id)
+        return self._call_claude(prompt, session_id, cost_details="revise_tasks")
 
     def _validate_tasks_json(self) -> bool:
         """校验 tasks.json 格式"""
@@ -1179,84 +1070,21 @@ class LongRunningAgent:
 
     def learn(self, suggestion: str) -> bool:
         """根据用户建议更新 CLAUDE.md"""
-        import json as json_module
-
         print("\n" + "=" * 60)
         print("📚 Claude 正在学习并更新 CLAUDE.md...")
         print("=" * 60)
 
         prompt = LEARN_PROMPT.format(suggestion=suggestion)
+        result_text, _ = self._call_claude(prompt, cost_details="learn")
 
-        try:
-            process = subprocess.Popen(
-                [
-                    CLAUDE_CMD,
-                    "-p",
-                    "--verbose",
-                    "--output-format", "stream-json",
-                    "--dangerously-skip-permissions",
-                    prompt,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=self.workspace_dir,
-            )
-
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json_module.loads(line)
-                    evt_type = event.get("type", "")
-
-                    if evt_type == "assistant":
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                preview = truncate_for_display(text)
-                                if preview:
-                                    print(f"   💭 {preview}")
-                            elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "")
-                                inp = summarize_tool_input(tool_name, block.get("input", {}))
-                                if inp:
-                                    print(f"   🔧 {tool_name}: {inp}")
-                                else:
-                                    print(f"   🔧 {tool_name}")
-
-                    elif evt_type == "result":
-                        result = event.get("result", "")
-                        cost = event.get("total_cost_usd", 0)
-                        if cost > 0:
-                            self.cost_tracker.add(
-                                source=CostSource.TASK_GENERATION,
-                                cost_usd=cost,
-                                details="learn"
-                            )
-                        print(f"\n   💰 成本: ${cost:.4f}")
-
-                        if "LEARNED" in result:
-                            print("\n✅ CLAUDE.md 已更新！")
-                            return True
-
-                except json_module.JSONDecodeError:
-                    continue
-
-            process.wait()
-
-            if process.returncode != 0:
-                stderr = process.stderr.read()
-                print(f"❌ 调用失败: {stderr}")
-                return False
-
+        if result_text and "LEARNED" in result_text:
+            print("\n✅ CLAUDE.md 已更新！")
             return True
 
-        except Exception as e:
-            print(f"❌ 学习失败: {e}")
+        if result_text is None:
             return False
+
+        return True
 
 
 
