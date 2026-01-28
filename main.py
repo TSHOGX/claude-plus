@@ -21,13 +21,13 @@ from config import (
     get_paths,
     is_safe_workspace,
     CLAUDE_CMD,
-    TASK_GENERATION_PROMPT,
+    TASK_MODIFICATION_PROMPT,
     TASKS_CREATION_PROMPT,
-    TASKS_FIX_PROMPT,
     TASKS_REVISION_PROMPT,
     LEARN_PROMPT,
     TaskStatus,
     truncate_for_display,
+    summarize_tool_input,
 )
 from task_manager import TaskManager, Task
 from worker import WorkerProcess
@@ -771,6 +771,8 @@ class LongRunningAgent:
                     task_id=task.id,
                     details="Validation failed orchestration"
                 )
+            # Orchestrator 可能修改了 tasks.json，刷新内存
+            self.task_manager._load_tasks()
 
         # 清理 worker 日志（可选）
         # worker.cleanup()
@@ -795,33 +797,101 @@ class LongRunningAgent:
 
         print("\n" + self._get_git_context())
 
-    def add_task_from_prompt(self, user_request: str):
-        """根据用户自然语言描述生成并添加任务"""
-        import json as json_module
-
+    def add_task_from_prompt(self, user_request: str) -> bool:
+        """根据用户自然语言描述修改任务列表，支持交互式反馈循环"""
         print("\n" + "=" * 60)
-        print("🤖 分析需求，生成任务...")
+        print("🤖 Claude 正在分析需求并修改任务列表...")
         print("=" * 60)
 
-        # 构建 prompt
-        prompt = TASK_GENERATION_PROMPT.format(user_request=user_request)
+        # 检查 tasks.json 是否存在
+        if not os.path.exists(self.tasks_file):
+            print(f"\n⚠️  tasks.json 不存在: {self.tasks_file}")
+            print("   请先运行 'python3 main.py init' 初始化项目")
+            return False
 
-        # 调用 Claude（流式输出）
+        # 构建 prompt
+        prompt = TASK_MODIFICATION_PROMPT.format(user_request=user_request)
+
+        # 调用 Claude Code（在 workspace 目录下）
+        result, session_id = self._call_claude_for_modification(prompt)
+
+        # 交互式反馈循环
+        while True:
+            if not (result and "TASKS_MODIFIED" in result):
+                print("\n❌ 任务修改失败")
+                return False
+
+            # 校验修改后的 tasks.json
+            if not self._validate_tasks_json():
+                print("\n❌ 修改后的 tasks.json 格式无效")
+                return False
+
+            print("\n✅ tasks.json 修改成功！")
+
+            # 重新加载并显示任务列表
+            self.task_manager._load_tasks()
+            self._show_generated_tasks()
+
+            # 询问用户反馈
+            print("\n" + "-" * 40)
+            print("请确认任务列表：")
+            print("  - 输入 y 确认")
+            print("  - 输入反馈文字，Claude 将继续修改")
+            print("-" * 40)
+
+            user_input = input("\n确认或反馈: ").strip()
+
+            if user_input.lower() == 'y':
+                break
+            elif user_input == '':
+                print("已取消（输入为空）")
+                return False
+            else:
+                # 用户提供反馈，resume session 继续修改
+                if not session_id:
+                    print("⚠️  无法获取会话 ID，无法继续修改")
+                    print("请手动修改 tasks.json 或重新运行 task 命令")
+                    return False
+
+                print("\n" + "=" * 60)
+                print("🔄 Claude 正在根据反馈继续修改...")
+                print("=" * 60)
+
+                result, session_id = self._call_claude_for_revision(
+                    session_id, user_input
+                )
+
+        print(f"\n✅ 任务修改完成！")
+        print(f"   运行 'python3 main.py run' 开始执行")
+        return True
+
+    def _call_claude_for_modification(self, prompt: str, resume_session_id: str = None):
+        """调用 Claude Code 修改任务，返回 (result, session_id)"""
+        import json as json_module
         try:
+            cmd = [
+                CLAUDE_CMD,
+                "-p",
+                "--verbose",
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",
+            ]
+
+            if resume_session_id:
+                cmd.extend(["--resume", resume_session_id])
+
+            cmd.append(prompt)
+
             process = subprocess.Popen(
-                [
-                    CLAUDE_CMD,
-                    "-p",
-                    "--verbose",
-                    "--output-format", "stream-json",
-                    "--dangerously-skip-permissions",
-                    prompt,
-                ],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=self.workspace_dir,
             )
+
+            full_result = ""
+            session_id = None
 
             for line in process.stdout:
                 line = line.strip()
@@ -831,7 +901,10 @@ class LongRunningAgent:
                     event = json_module.loads(line)
                     evt_type = event.get("type", "")
 
-                    if evt_type == "assistant":
+                    if evt_type == "system" and event.get("subtype") == "init":
+                        session_id = event.get("session_id")
+
+                    elif evt_type == "assistant":
                         content = event.get("message", {}).get("content", [])
                         for block in content:
                             if block.get("type") == "text":
@@ -839,8 +912,17 @@ class LongRunningAgent:
                                 preview = truncate_for_display(text)
                                 if preview:
                                     print(f"   💭 {preview}")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "")
+                                inp = summarize_tool_input(tool_name, block.get("input", {}))
+                                if inp:
+                                    print(f"   🔧 {tool_name}: {inp}")
+                                else:
+                                    print(f"   🔧 {tool_name}")
 
                     elif evt_type == "result":
+                        full_result = event.get("result", "")
+                        session_id = event.get("session_id", session_id)
                         cost = event.get("total_cost_usd", 0)
                         if cost > 0:
                             self.cost_tracker.add(
@@ -854,106 +936,11 @@ class LongRunningAgent:
                     continue
 
             process.wait()
-
-            if process.returncode != 0:
-                stderr = process.stderr.read()
-                print(f"❌ 调用失败: {stderr}")
-                return False
-
-            # 验证生成的 tasks.json
-            validation_errors = self._validate_generated_tasks()
-            if validation_errors:
-                print(f"\n   ⚠️  任务格式有误，尝试修复...")
-                if not self._fix_tasks_json(validation_errors):
-                    print(f"❌ 修复调用失败")
-                    return False
-                validation_errors = self._validate_generated_tasks()
-                if validation_errors:
-                    print(f"❌ 任务格式修复失败: {'; '.join(validation_errors)}")
-                    return False
-
-            # 重新加载任务
-            self.task_manager._load_tasks()
-            self._show_generated_tasks()
-            print(f"\n✅ 任务添加成功！")
-            print(f"   运行 'python3 main.py run' 开始执行")
-            return True
+            return full_result, session_id
 
         except Exception as e:
-            print(f"❌ 生成失败: {e}")
-            return False
-
-    def _validate_generated_tasks(self) -> list:
-        """验证 tasks.json 格式，返回错误列表（空 = 通过）"""
-        import json as json_module
-        try:
-            with open(self.tasks_file, "r", encoding="utf-8") as f:
-                data = json_module.load(f)
-        except json_module.JSONDecodeError as e:
-            return [f"JSON 解析失败: {e}"]
-        except FileNotFoundError:
-            return ["tasks.json 不存在"]
-
-        if not isinstance(data, list):
-            return ["tasks.json 应该是一个数组"]
-
-        errors = []
-        ids = []
-        for i, task in enumerate(data):
-            if not task.get("id"):
-                errors.append(f"任务[{i}] 缺少 id")
-            else:
-                # 检查 ID 格式（路径编码）
-                task_id = task["id"]
-                parts = task_id.split('.')
-                for part in parts:
-                    if not part.isdigit():
-                        errors.append(f"任务[{i}] ID 格式错误: '{task_id}'，应为数字路径编码")
-                        break
-                if task_id in ids:
-                    errors.append(f"任务 ID 重复: {task_id}")
-                ids.append(task_id)
-            if not task.get("description"):
-                errors.append(f"任务[{i}] 缺少 description")
-
-        return errors
-
-    def _fix_tasks_json(self, errors: list) -> bool:
-        """调用 Claude 修复 tasks.json 格式问题"""
-        import json as json_module
-        prompt = TASKS_FIX_PROMPT.format(
-            errors="\n".join(f"- {e}" for e in errors)
-        )
-
-        try:
-            result = subprocess.run(
-                [
-                    CLAUDE_CMD,
-                    "-p",
-                    "--output-format", "json",
-                    "--dangerously-skip-permissions",
-                    prompt,
-                ],
-                capture_output=True,
-                text=True,
-                cwd=self.workspace_dir,
-            )
-
-            if result.returncode != 0:
-                return False
-
-            output_data = json_module.loads(result.stdout)
-            cost = output_data.get("total_cost_usd", 0)
-            if cost > 0:
-                self.cost_tracker.add(
-                    source=CostSource.TASK_GENERATION,
-                    cost_usd=cost,
-                    details="fix_tasks_json"
-                )
-            return True
-
-        except Exception:
-            return False
+            print(f"❌ 调用失败: {e}")
+            return None, None
 
     def reset(self):
         """重置所有任务状态"""
@@ -1114,7 +1101,7 @@ class LongRunningAgent:
                         session_id = event.get("session_id")
 
                     elif evt_type == "assistant":
-                        # 显示思考过程摘要
+                        # 显示思考过程和工具调用
                         content = event.get("message", {}).get("content", [])
                         for block in content:
                             if block.get("type") == "text":
@@ -1122,6 +1109,13 @@ class LongRunningAgent:
                                 preview = truncate_for_display(text)
                                 if preview:
                                     print(f"   💭 {preview}")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "")
+                                inp = summarize_tool_input(tool_name, block.get("input", {}))
+                                if inp:
+                                    print(f"   🔧 {tool_name}: {inp}")
+                                else:
+                                    print(f"   🔧 {tool_name}")
 
                     elif evt_type == "result":
                         full_result = event.get("result", "")
@@ -1225,6 +1219,13 @@ class LongRunningAgent:
                                 preview = truncate_for_display(text)
                                 if preview:
                                     print(f"   💭 {preview}")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "")
+                                inp = summarize_tool_input(tool_name, block.get("input", {}))
+                                if inp:
+                                    print(f"   🔧 {tool_name}: {inp}")
+                                else:
+                                    print(f"   🔧 {tool_name}")
 
                     elif evt_type == "result":
                         result = event.get("result", "")
@@ -1303,9 +1304,9 @@ def main():
     reset_task_parser = subparsers.add_parser("reset-task", help="重置单个任务状态")
     reset_task_parser.add_argument("task_id", help="要重置的任务 ID")
 
-    # add 命令
-    add_parser = subparsers.add_parser("add", help="根据描述新增任务")
-    add_parser.add_argument("description", help="任务需求描述")
+    # task 命令
+    task_parser = subparsers.add_parser("task", help="根据描述修改任务列表")
+    task_parser.add_argument("description", help="任务修改描述")
 
     # learn 命令
     learn_parser = subparsers.add_parser("learn", help="学习建议并更新 CLAUDE.md")
@@ -1336,7 +1337,7 @@ def main():
         agent.reset()
     elif args.command == "reset-task":
         agent.reset_single_task(args.task_id)
-    elif args.command == "add":
+    elif args.command == "task":
         agent.add_task_from_prompt(args.description)
     elif args.command == "learn":
         agent.learn(args.suggestion)

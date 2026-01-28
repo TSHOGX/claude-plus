@@ -133,7 +133,7 @@ python3 main.py -w ~/my-project status
 | `init [描述]` | 初始化环境；可选提供需求描述，自动生成 tasks.json |
 | `run` | 运行任务处理 |
 | `status` | 显示当前状态 |
-| `add "描述"` | 根据自然语言描述追加任务到现有列表 |
+| `task "描述"` | 根据自然语言描述修改任务列表（增删改） |
 | `learn "建议"` | 学习建议并自动更新 CLAUDE.md |
 | `reset` | 重置所有任务 |
 | `reset-task <id>` | 重置单个任务 |

@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import unicodedata
 
 # 默认工作目录
 DEFAULT_WORKSPACE_DIR = os.path.join(
@@ -50,15 +51,63 @@ def get_display_width() -> int:
     return max(40, int((terminal_width - 30) * 0.8))
 
 
+def _char_width(char: str) -> int:
+    """计算单个字符的显示宽度（中文等宽字符为2，其他为1）"""
+    width_type = unicodedata.east_asian_width(char)
+    return 2 if width_type in ('F', 'W') else 1
+
+
 def truncate_for_display(text: str) -> str:
-    """截断文本用于终端显示，换行替换为空格"""
+    """截断文本用于终端显示，换行替换为空格，正确处理中文宽度"""
     if not text:
         return ""
     text = text.replace("\n", " ").strip()
     max_width = get_display_width()
-    if len(text) <= max_width:
-        return text
-    return text[:max_width] + "..."
+
+    # 计算显示宽度并截断
+    current_width = 0
+    for i, char in enumerate(text):
+        char_w = _char_width(char)
+        if current_width + char_w > max_width:
+            return text[:i] + "..."
+        current_width += char_w
+    return text
+
+
+def summarize_tool_input(tool_name: str, tool_input: dict) -> str:
+    """提取工具输入的简要摘要"""
+    if not isinstance(tool_input, dict):
+        return ""
+
+    if tool_name == "Bash":
+        return truncate_for_display(tool_input.get("command", ""))
+    elif tool_name in ("Read", "Write", "Edit"):
+        path = tool_input.get("file_path", "")
+        return os.path.basename(path)
+    elif tool_name == "Grep":
+        pattern = truncate_for_display(tool_input.get("pattern", ""))
+        path = tool_input.get("path", "")
+        if path:
+            return f"{pattern} in {os.path.basename(path)}"
+        return pattern
+    elif tool_name == "Glob":
+        return truncate_for_display(tool_input.get("pattern", ""))
+    elif tool_name == "Task":
+        return truncate_for_display(tool_input.get("description", ""))
+    elif tool_name == "TaskOutput":
+        return truncate_for_display(tool_input.get("task_id", ""))
+    elif tool_name == "WebFetch":
+        url = tool_input.get("url", "")
+        if "://" in url:
+            url = url.split("://")[1].split("/")[0]
+        return truncate_for_display(url)
+    elif tool_name == "WebSearch":
+        return truncate_for_display(tool_input.get("query", ""))
+    else:
+        for key in ["subject", "description", "pattern", "query", "command", "file_path", "path", "task_id"]:
+            if key in tool_input:
+                return truncate_for_display(str(tool_input[key]))
+    return ""
 
 # 任务状态
 class TaskStatus:
@@ -109,33 +158,47 @@ CLEANUP_PROMPT_TEMPLATE = """⚠️ 紧急通知：任务需要终止，请立�
 
 
 
-# 任务生成提示模板
-TASK_GENERATION_PROMPT = """根据用户需求，生成结构化的开发任务并追加到 tasks.json。
+# 任务修改提示模板（用于 add 命令修改任务列表）
+TASK_MODIFICATION_PROMPT = """根据用户需求，修改 tasks.json 任务列表。
 
 ## 用户需求
 {user_request}
 
 ## 你的任务
-1. 阅读 tasks.json 了解现有任务（如果存在）
-2. 生成新任务，追加到现有任务列表
-3. 直接编辑 tasks.json 文件
+1. 阅读 tasks.json 了解现有任务
+2. 利用 git log 了解项目进展
+3. 根据用户需求，修改任务列表（增、删、改皆可）
+4. 直接编辑 tasks.json 文件
 
-## 任务 ID 规范
-ID 采用层级编号，用 `.` 分隔，深度优先前序遍历：1 → 1.1 → 1.2 → 2
+## tasks.json 规范
 
-## 任务格式
+### 任务 ID
+用 `.` 分隔的层级编号，深度优先前序遍历：1 → 1.1 → 1.2 → 2
+
+### 结构
 ```json
-{{
-  "id": "1.2",
-  "description": "任务描述",
-  "steps": ["步骤1", "步骤2"]
-}}
+[
+  {{
+    "id": "1",
+    "description": "任务描述",
+    "steps": ["步骤1", "步骤2"],
+    "status": "pending|in_progress|completed|failed"
+  }}
+]
 ```
 
-## 要求
-- 任务粒度适中（10-15 分钟可完成）
-- steps 是参考指引，执行时可灵活调整
-- ID 不要与现有任务重复"""
+### 编写原则
+- 单一职责, 每个任务只做一件事
+- 适中粒度, 10-15 分钟可完成
+- steps 是参考, 执行时可灵活调整
+
+### 修改原则
+- 新增任务时, 添加到合适位置, ID 不要重复
+- 修改/删除 pending/in_progress/failed 状态的任务
+- 保留 completed 状态的任务, 不要修改
+
+## 输出
+完成后输出 TASKS_MODIFIED"""
 
 # 任务格式修复提示模板
 TASKS_FIX_PROMPT = """tasks.json 存在以下格式问题，请修复：
@@ -282,14 +345,19 @@ ORCHESTRATOR_PROMPT = """你是任务编排者。需要重新审视和调整任�
 ID 用 `.` 分隔，深度优先前序遍历：1 → 1.1 → 1.2 → 2
 
 ## 编排操作
-- **增/删/改**: 根据实际情况调整任务
-- **拆分/合并**: 调整任务粒度（10-15分钟可完成）
-- **利用 notes**: 在任务间传递上下文（进展、问题、建议）
+- 增/删/改: 根据实际情况调整任务
+- 拆分/合并: 调整任务粒度（10-15分钟可完成）
+- 利用 notes: 在任务间传递上下文（进展、问题、建议）
 
 ## 注意事项
 - failed 任务必须处理（不能保持 failed 状态）
 - completed 任务不要修改
 - ID 保持唯一
+- 验证失败场景处理: 如果触发原因包含"验证失败"：
+  1. 检查 git status 了解剩余未提交的文件
+  2. 不要重复执行原任务
+  3. 如果任务实际已完成，只是有多余文件：将原任务标记为 completed，创建新任务处理这些文件（如加入 .gitignore）
+  4. 如果任务确实未完成，调整任务描述使其更清晰
 
 完成后输出 ORCHESTRATION_DONE
 """
@@ -337,5 +405,5 @@ TASKS_REVISION_PROMPT = """用户对任务列表提出了反馈，请根据反�
 ## 要求
 1. 根据用户反馈修改 tasks.json
 2. 保持任务 ID 格式规范（路径编码）
-3. 修改完成后输出 TASKS_CREATED 确认
+3. 修改完成后输出 TASKS_MODIFIED 确认
 """

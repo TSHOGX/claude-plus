@@ -14,7 +14,7 @@ from typing import Optional, List
 from enum import Enum
 from task_manager import Task
 from worker import WorkerProcess
-from config import CLAUDE_CMD, SUPERVISOR_PROMPT
+from config import CLAUDE_CMD, SUPERVISOR_PROMPT, truncate_for_display, summarize_tool_input
 
 
 class Decision(Enum):
@@ -76,14 +76,15 @@ class Supervisor:
         if self.verbose:
             print(f"   🔍 Supervisor 分析中...")
 
-        # 调用 Claude 分析（不设超时，支持取消）
+        # 调用 Claude 分析（使用 stream-json 格式，支持取消）
         try:
             self._current_process = subprocess.Popen(
                 [
                     CLAUDE_CMD,
                     "-p",
+                    "--verbose",
                     "--output-format",
-                    "json",
+                    "stream-json",
                     "--dangerously-skip-permissions",
                     prompt,
                 ],
@@ -93,19 +94,58 @@ class Supervisor:
                 cwd=self.workspace_dir,
             )
 
-            stdout, _ = self._current_process.communicate()
+            full_result = ""
+            cost_usd = 0.0
+
+            for line in self._current_process.stdout:
+                # 检查是否被取消
+                if self._cancelled:
+                    self._current_process.terminate()
+                    self._current_process = None
+                    return SupervisorResult(decision=Decision.CONTINUE, reason="分析被取消")
+
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    evt_type = event.get("type", "")
+
+                    if evt_type == "assistant" and self.verbose:
+                        # 显示思考过程和工具调用
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                preview = truncate_for_display(text)
+                                if preview:
+                                    print(f"      💭 {preview}")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "")
+                                inp = summarize_tool_input(tool_name, block.get("input", {}))
+                                if inp:
+                                    print(f"      🔧 {tool_name}: {inp}")
+                                else:
+                                    print(f"      🔧 {tool_name}")
+
+                    elif evt_type == "result":
+                        full_result = event.get("result", "")
+                        cost_usd = event.get("total_cost_usd", 0.0)
+                        if self.verbose:
+                            print(f"      💰 成本: ${cost_usd:.4f}")
+
+                except json.JSONDecodeError:
+                    continue
+
+            self._current_process.wait()
             self._current_process = None
 
             # 检查是否被取消
             if self._cancelled:
                 return SupervisorResult(decision=Decision.CONTINUE, reason="分析被取消")
 
-            output_data = json.loads(stdout)
-            output_text = output_data.get("result", "")
-            cost_usd = output_data.get("total_cost_usd", 0.0)
-
             # 解析 JSON 响应
-            result = self._parse_response(output_text)
+            result = self._parse_response(full_result)
             result.cost_usd = cost_usd
             return result
 

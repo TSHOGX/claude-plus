@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 from task_manager import Task
-from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE, truncate_for_display
+from config import CLAUDE_CMD, SYSTEM_PROMPT_TEMPLATE, CLEANUP_PROMPT_TEMPLATE, TASK_PROMPT_TEMPLATE, truncate_for_display, summarize_tool_input
 
 
 @dataclass
@@ -372,19 +372,7 @@ class WorkerProcess:
                 elif block_type == "tool_use":
                     tool_name = block.get("name", "unknown")
                     tool_input = block.get("input", {})
-
-                    # 提取简要输入信息
-                    input_summary = ""
-                    if isinstance(tool_input, dict):
-                        if tool_name == "Bash":
-                            input_summary = truncate_for_display(tool_input.get("command", ""))
-                        elif tool_name in ("Read", "Write", "Edit"):
-                            path = tool_input.get("file_path", "")
-                            input_summary = os.path.basename(path)
-                        elif tool_name == "Grep":
-                            input_summary = truncate_for_display(tool_input.get("pattern", ""))
-                        elif tool_name == "Glob":
-                            input_summary = truncate_for_display(tool_input.get("pattern", ""))
+                    input_summary = summarize_tool_input(tool_name, tool_input)
 
                     result.events.append(
                         {"type": "tool", "name": tool_name, "input": input_summary}
@@ -447,7 +435,7 @@ class WorkerProcess:
                 elif block_type == "tool_use":
                     tool_name = block.get("name", "unknown")
                     tool_input = block.get("input", {})
-                    input_summary = self._summarize_tool_input(tool_name, tool_input)
+                    input_summary = summarize_tool_input(tool_name, tool_input)
                     return {"type": "tool", "name": tool_name, "input": input_summary}
 
         elif event_type == "result":
@@ -456,39 +444,6 @@ class WorkerProcess:
             return {"type": "result", "is_error": is_error, "result": truncate_for_display(result_text)}
 
         return None
-
-    def _summarize_tool_input(self, tool_name: str, tool_input: dict) -> str:
-        """提取工具输入的简要摘要"""
-        if not isinstance(tool_input, dict):
-            return ""
-
-        if tool_name == "Bash":
-            return truncate_for_display(tool_input.get("command", ""))
-        elif tool_name in ("Read", "Write", "Edit"):
-            path = tool_input.get("file_path", "")
-            return os.path.basename(path)
-        elif tool_name == "Grep":
-            pattern = truncate_for_display(tool_input.get("pattern", ""))
-            path = tool_input.get("path", "")
-            if path:
-                return f"{pattern} in {os.path.basename(path)}"
-            return pattern
-        elif tool_name == "Glob":
-            return truncate_for_display(tool_input.get("pattern", ""))
-        elif tool_name == "Task":
-            return truncate_for_display(tool_input.get("description", ""))
-        elif tool_name == "WebFetch":
-            url = tool_input.get("url", "")
-            if "://" in url:
-                url = url.split("://")[1].split("/")[0]
-            return truncate_for_display(url)
-        elif tool_name == "WebSearch":
-            return truncate_for_display(tool_input.get("query", ""))
-        else:
-            for key in ["pattern", "query", "command", "file_path", "path"]:
-                if key in tool_input:
-                    return truncate_for_display(str(tool_input[key]))
-        return ""
 
     def get_log_summary(self, max_events: int = 30) -> str:
         """获取日志摘要（用于 Supervisor 分析）- 按时序展示执行流程"""

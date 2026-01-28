@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from config import CLAUDE_CMD, ORCHESTRATOR_PROMPT, ORCHESTRATOR_REVIEW_PROMPT, truncate_for_display
+from config import CLAUDE_CMD, ORCHESTRATOR_PROMPT, ORCHESTRATOR_REVIEW_PROMPT, truncate_for_display, summarize_tool_input
 
 
 @dataclass
@@ -160,6 +160,7 @@ class TaskOrchestrator:
                 [
                     CLAUDE_CMD,
                     "-p",
+                    "--verbose",
                     "--output-format", "stream-json",
                     "--dangerously-skip-permissions",
                     prompt,
@@ -180,7 +181,7 @@ class TaskOrchestrator:
                     evt_type = event.get("type", "")
 
                     if evt_type == "assistant" and self.verbose:
-                        # 显示思考过程
+                        # 显示思考过程和工具调用
                         content = event.get("message", {}).get("content", [])
                         for block in content:
                             if block.get("type") == "text":
@@ -188,13 +189,13 @@ class TaskOrchestrator:
                                 preview = truncate_for_display(text)
                                 if preview:
                                     print(f"      💭 {preview}")
-
-                    elif evt_type == "content_block_start" and self.verbose:
-                        # 工具调用开始
-                        cb = event.get("content_block", {})
-                        if cb.get("type") == "tool_use":
-                            tool_name = cb.get("name", "")
-                            print(f"      🔧 {tool_name}")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "")
+                                inp = summarize_tool_input(tool_name, block.get("input", {}))
+                                if inp:
+                                    print(f"      🔧 {tool_name}: {inp}")
+                                else:
+                                    print(f"      🔧 {tool_name}")
 
                     elif evt_type == "result":
                         full_result = event.get("result", "")
